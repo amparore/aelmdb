@@ -174,6 +174,14 @@ typedef SSIZE_T	ssize_t;
 # endif
 #elif defined(__ANDROID__)
 # define MDB_FDATASYNC		fsync
+#elif defined(__HAIKU__)
+# define MDB_USE_POSIX_SEM	1
+# define MDB_FDATASYNC		fsync
+#endif
+
+/* NetBSD does not define union semun in sys/sem.h */
+#if defined(__NetBSD__) && !defined(_SEM_SEMUN_UNDEFINED)
+# define _SEM_SEMUN_UNDEFINED  1
 #endif
 
 #ifndef _WIN32
@@ -673,9 +681,9 @@ static txnid_t mdb_debug_start;
 #define MDB_MAGIC	 0xBEEFC0DE
 
 	/**	The version number for a database's datafile format. */
-/* Aggregate fork file format tag.
- * Upper 16 bits identify this fork format, lower 16 bits bind MDB_HASH_SIZE.
- */
+	/* Aggregate fork file format tag.
+	* Upper 16 bits identify this fork format, lower 16 bits bind MDB_HASH_SIZE.
+	*/
 #define MDB_DATA_VERSION_TAG   0xA332u
 #define MDB_DATA_VERSION \
 	((MDB_DATA_VERSION_TAG << 16) | ((unsigned)(MDB_HASH_SIZE) & 0xFFFFu))
@@ -1044,7 +1052,6 @@ typedef struct MDB_page {
 #define	P_AGG_KEYS	 MDB_AGG_KEYS		/**< aggregate: distinct keys */
 #define	P_AGG_HASHSUM	 MDB_AGG_HASHSUM		/**< aggregate: hash-sum */
 #define	P_AGG_MASK	 MDB_AGG_MASK		/**< mask of aggregate page bits */
-#define	P_COUNTED	 P_AGG_ENTRIES		/**< branch page stores subtree counts (legacy name) */
 #define	P_LOOSE		 0x4000		/**< page was dirtied then freed, can be reused */
 #define	P_KEEP		 0x8000		/**< leave this page alone during spill */
 /** @} */
@@ -1132,7 +1139,7 @@ mdb_page_pgno_set(MDB_page *mp, pgno_t pgno)
 	/** Test if a page is a branch page */
 #define IS_BRANCH(p)	 F_ISSET(MP_FLAGS(p), P_BRANCH)
 	/** Test if a branch page stores subtree counts */
-#define IS_COUNTED(p)	 F_ISSET(MP_FLAGS(p), P_COUNTED)
+#define IS_COUNTED(p)	 F_ISSET(MP_FLAGS(p), P_AGG_ENTRIES)
 
 	/** Aggregate flag helpers (DB flags and page flags share the same bits) */
 #define PAGE_AGGFLAGS(p)	 ((uint16_t)(MP_FLAGS(p) & P_AGG_MASK))
@@ -1231,8 +1238,8 @@ typedef struct MDB_aggval {
 
 
 	/** Number of aggregate prefix bytes before the key in an aggregated branch node.
- * The prefix length is deduced from aggregate flag bits stored in the page header.
- */
+ 	 * The prefix length is deduced from aggregate flag bits stored in the page header.
+	 */
 static inline size_t
 mdb_agg_prefix_len_flags(uint16_t agg)
 {
@@ -1327,13 +1334,14 @@ mdb_agg_is_zero(uint16_t agg, const MDB_aggval *a)
 	return 1;
 }
 
-/** Build a magnitude-only delta blob for the entries component. */
-static inline void
-mdb_agg_make_entries_delta(uint16_t agg, MDB_aggval *out, uint64_t n)
-{
-	mdb_agg_zero(agg, out);
-	mdb_agg_entries_set(agg, out, n);
-}
+// TODO: remove
+// /** Build a magnitude-only delta blob for the entries component. */
+// static inline void
+// mdb_agg_make_entries_delta(uint16_t agg, MDB_aggval *out, uint64_t n)
+// {
+// 	mdb_agg_zero(agg, out);
+// 	mdb_agg_entries_set(agg, out, n);
+// }
 
 
 /** Build a magnitude-only delta blob for the entries+keys components. */
@@ -2298,8 +2306,7 @@ mdb_page_list(MDB_page *mp)
 	fprintf(stderr, "%s %"Yu" numkeys %d%s\n", type, pgno, nkeys, state);
 
 	for (i=0; i<nkeys; i++) {
-		if (IS_LEAF2(mp)) {
-			//mdb_tassert(mc->mc_txn, (mc->mc_flags & C_SUB) != 0);	/* LEAF2 pages have no mp_ptrs[] or node headers */
+		if (IS_LEAF2(mp)) { /* LEAF2 pages have no mp_ptrs[] or node headers */
 			key.mv_size = nsize = mp->mp_pad;
 			key.mv_data = LEAF2KEY(mp, i, nsize);
 			total += nsize;
@@ -2507,6 +2514,20 @@ typedef enum mdb_agg_subtree_mode {
 #define MDB_AGG_SUBTREE_MAINT MDB_AGG_SUBTREE_STRICT
 #endif
 
+/* Debug build knobs for aggregate code:
+ *  - MDB_DEBUG_AGG_INTEGRITY: expensive integrity checks / assertions
+ *  - MDB_DEBUG_AGG_PRINT:     verbose aggregate tracing / dumps
+ */
+#if defined(MDB_DEBUG_AGG_INTEGRITY) || defined(MDB_DEBUG_AGG_PRINT)
+#define MDB_DEBUG_AGG_ANY 1
+#endif
+
+#ifdef MDB_DEBUG_AGG_PRINT
+#define MDB_AGG_DBG_PRINTF(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define MDB_AGG_DBG_PRINTF(...) ((void)0)
+#endif
+
 /* Mark the transaction as corrupted due to a aggregate-branches invariant violation.
  * These checks are intentionally strict: in a aggregate DB, every branch page in
  * the tree must carry the DB's P_AGG_* bits, because they change the on-page node layout.
@@ -2515,23 +2536,21 @@ static inline int
 mdb_agg_corrupt(MDB_cursor *mc, const char *where,
     const MDB_page *pp, const MDB_page *cp, pgno_t expect_child)
 {
-#ifdef MDB_DEBUG_COUNTER
-	fprintf(stderr,
+	MDB_AGG_DBG_PRINTF(
 	    "[AGG CORRUPTED] %s parent=%"Yu" child=%"Yu" expect=%"Yu"\n",
 	    where ? where : "",
 	    pp ? pp->mp_pgno : (pgno_t)0,
 	    cp ? cp->mp_pgno : (pgno_t)0,
 	    expect_child);
-#endif
 	mdb_txn_mark_error(mc ? mc->mc_txn : NULL, MDB_CORRUPTED);
 	return MDB_CORRUPTED;
 }
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 /* Forward declarations used by fail-fast aggregate checking in write paths. */
 int mdb_dbg_check_agg_db(MDB_txn *txn, MDB_dbi dbi);
 static int mdb_dbg_check_agg_txn_all(MDB_txn *txn);
-#endif /* MDB_DEBUG_COUNTER */
+#endif /* MDB_DEBUG_AGG_INTEGRITY */
 
 
 /* Compute the subtree record count rooted at mp.
@@ -2737,40 +2756,6 @@ mdb_page_subtree_agg(MDB_cursor *mc, MDB_page *mp, MDB_aggval *out,
 	return MDB_SUCCESS;
 }
 
-/* Backward-compatible wrapper (entries-only view) used by existing counted code. */
-static inline int
-mdb_page_subtree_entries(MDB_cursor *mc, MDB_page *mp, uint64_t *out,
-	mdb_agg_subtree_mode mode)
-{
-	MDB_aggval a;
-	uint16_t agg;
-
-	if (!out)
-		return MDB_PROBLEM;
-	if (!mc || !mp) {
-		*out = 0;
-		return MDB_PROBLEM;
-	}
-
-	agg = DB_AGGFLAGS(mc->mc_db);
-	if (!agg) {
-		*out = 0;
-		return MDB_SUCCESS;
-	}
-
-	{
-		int rc = mdb_page_subtree_agg(mc, mp, &a, mode);
-		if (rc) {
-			*out = 0;
-			return rc;
-		}
-	}
-	*out = mdb_agg_entries_get(agg, &a);
-	return MDB_SUCCESS;
-}
-
-
-
 
 /* Add all enabled components from SRC into ACC (ACC += SRC). */
 static int
@@ -2956,12 +2941,9 @@ mdb_propagate_agg_delta_ex(MDB_cursor *mc, int level, const MDB_aggval *delta, i
 		mdb_agg_hashsum_apply_delta(agg, &cur, delta, subtract);
 		mdb_node_set_agg_blob(pp, node, &cur);
 
-#ifdef MDB_DEBUG_COUNTER
-		fprintf(stderr,
-		    "[AGG propagate] lvl=%d parent=%"Yu" child=%"Yu" %s ent=%"PRIu64" keys=%"PRIu64"\n",
-		    level, pp->mp_pgno, cp->mp_pgno,
-		    subtract ? "sub" : "add", (uint64_t)emag, (uint64_t)kmag);
-#endif
+		MDB_AGG_DBG_PRINTF("[AGG propagate] lvl=%d parent=%"Yu" child=%"Yu" %s ent=%"PRIu64" keys=%"PRIu64"\n",
+							level, pp->mp_pgno, cp->mp_pgno,
+							subtract ? "sub" : "add", (uint64_t)emag, (uint64_t)kmag);
 	}
 	return MDB_SUCCESS;
 }
@@ -3087,45 +3069,11 @@ mdb_agg_refresh_link_agg(MDB_cursor *mc, MDB_page *pp, pgno_t child_pgno,
 }
 
 /*
- * Backward-compatible wrapper: refresh link aggregate from an entries-only count.
- *
- * This is used by existing counted code paths that only compute the entries
- * contribution. It constructs a schema-sized aggregate blob and calls the
- * generic refresh primitive.
- */
-static inline int
-mdb_agg_refresh_link_count(MDB_cursor *mc, MDB_page *pp, pgno_t child_pgno,
-    indx_t guess, uint64_t newcount, mdb_agg_link_mode mode,
-    int64_t *out_diff, int *out_found)
-{
-	MDB_aggval a;
-	uint16_t agg;
-
-	if (out_diff)
-		*out_diff = 0;
-	if (out_found)
-		*out_found = 0;
-
-	if (!mc || !HAS_AGG(mc->mc_db))
-		return MDB_SUCCESS;
-	if (!pp)
-		return mdb_agg_corrupt(mc, "refresh_null_parent", NULL, NULL, child_pgno);
-
-	agg = PAGE_AGGFLAGS(pp);
-	mdb_agg_zero(agg, &a);
-	mdb_agg_entries_set(agg, &a, newcount);
-
-	return mdb_agg_refresh_link_agg(mc, pp, child_pgno, guess, &a, mode,
-	    out_diff, out_found);
-}
-
-/*
  * Refresh a single parent->child link-count by recomputing the child's subtree.
  *
- * This is a convenience wrapper around mdb_page_subtree_entries() (STRICT mode)
- * plus
- * mdb_agg_refresh_link_count(). It is used when the caller has the child
- * page pointer and wants the count derived from the current on-page state.
+ * This is a convenience wrapper around mdb_page_subtree_agg() (MAINT mode)
+ * plus mdb_agg_refresh_link_agg(). It is used when the caller has the child
+ * page pointer and wants the aggregate derived from the current on-page state.
  */
 static inline int
 mdb_agg_refresh_link(MDB_cursor *mc, MDB_page *pp, MDB_page *cp, indx_t guess,
@@ -3201,31 +3149,6 @@ mdb_cursor_find_page_level(const MDB_cursor *mc, const MDB_page *mp)
 			return (int)i;
 	}
 	return -1;
-}
-
-/* Return the current root page from a cursor stack, validating that it is a
- * branch page with the DB's aggregate schema (when aggregates are enabled).
- * Returns NULL if root is not available on the stack.
- */
-static inline MDB_page *
-mdb_agg_root_page(MDB_cursor *mc)
-{
-	MDB_page *rootp;
-
-	if (!mc || !HAS_AGG(mc->mc_db) || mc->mc_snum == 0)
-		return NULL;
-
-	rootp = mc->mc_pg[0];
-	if (!rootp)
-		return NULL;
-
-	/* Root can be a leaf for tiny DBs. Callers that require a branch root
-	 * must check IS_BRANCH(rootp) themselves.
-	 */
-	if (HAS_AGG(mc->mc_db)) {
-		mdb_tassert(mc->mc_txn, PAGE_AGGFLAGS(rootp) == DB_AGGFLAGS(mc->mc_db));
-	}
-	return rootp;
 }
 
 /* Get the current root page for mc->mc_db.
@@ -3432,11 +3355,10 @@ mdb_agg_reconcile_stack(MDB_cursor *mc, int start_level, const char *tag)
 		if (rc)
 			return rc;
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_PRINT
 		if (diff) {
-			fprintf(stderr,
-			    "[PUTCNT reconcile] %s lvl=%d parent=%"Yu" child=%"Yu" diff=%"PRId64" new=%"PRIu64"\n",
-			    tag ? tag : "", lvl-1, pp->mp_pgno, cp->mp_pgno, diff, newcount);
+			MDB_AGG_DBG_PRINTF("[PUTCNT reconcile] %s lvl=%d parent=%"Yu" child=%"Yu" diff=%"PRId64" new=%"PRIu64"\n",
+			    				tag ? tag : "", lvl-1, pp->mp_pgno, cp->mp_pgno, diff, newcount);
 		}
 #else
 		(void)tag;
@@ -3562,7 +3484,8 @@ mdb_agg_split_repair(MDB_cursor *mc, MDB_cursor *mn,
 	if (rc)
 		return rc;
 
-#ifdef MDB_DEBUG_COUNTER
+
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 	/* Debug-only: occasionally verify that fast-branch sibling aggregates match
 	 * a strict recursive recomputation. This is a read-only check; it does not
 	 * alter the update logic.
@@ -3588,7 +3511,7 @@ mdb_agg_split_repair(MDB_cursor *mc, MDB_cursor *mn,
 				return mdb_agg_corrupt(mc, "split_sibling_fast_mismatch_r", NULL, rp, rp->mp_pgno);
 		}
 	}
-#endif /* MDB_DEBUG_COUNTER */
+#endif /* MDB_DEBUG_AGG_INTEGRITY */
 
 /* Candidate parent pages where the sibling links might live. */
 	pp1 = (ptop <= mc->mc_top) ? mc->mc_pg[ptop] : NULL;
@@ -3733,7 +3656,7 @@ mdb_agg_split_repair(MDB_cursor *mc, MDB_cursor *mn,
 
 
 static inline int
-mdb_adjust_agg_parents_ex(MDB_cursor *mc, MDB_page *mp, const MDB_aggval *delta, int subtract, int stack_touched)
+mdb_adjust_agg_parents(MDB_cursor *mc, MDB_page *mp, const MDB_aggval *delta, int subtract, int stack_touched)
 {
 	MDB_page *pp;
 	MDB_node *node;
@@ -3835,13 +3758,6 @@ mdb_adjust_agg_parents_ex(MDB_cursor *mc, MDB_page *mp, const MDB_aggval *delta,
 		return rc;
 	return MDB_SUCCESS;
 }
-
-static inline int
-mdb_adjust_agg_parents(MDB_cursor *mc, MDB_page *mp, const MDB_aggval *delta, int subtract)
-{
-	return mdb_adjust_agg_parents_ex(mc, mp, delta, subtract, 0);
-}
-
 
 /* After complex split sequences (e.g. a leaf split triggering a recursive
  * branch/root split), higher-level branch link-counts may have been computed
@@ -4263,7 +4179,7 @@ mdb_page_dirty(MDB_txn *txn, MDB_page *mp)
 	mid.mid = mp->mp_pgno;
 	mid.mptr = mp;
 	rc = insert(txn->mt_u.dirty_list, &mid);
-	mdb_tassert(txn, rc == 0);
+	mdb_tassert(txn, rc == 0); (void)rc;
 	txn->mt_dirty_room--;
 }
 
@@ -5979,7 +5895,7 @@ _mdb_txn_commit(MDB_txn *txn)
 	if (rc)
 		goto fail;
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 	/* Fail-fast aggregate verification at commit time.
 	 * This also covers internal _mdb_cursor_put() calls during commit (e.g. MAIN_DBI updates for named DBs),
 	 * which bypass the public mdb_put() wrapper.
@@ -5992,7 +5908,7 @@ _mdb_txn_commit(MDB_txn *txn)
 			goto fail;
 		}
 	}
-#endif /* MDB_DEBUG_COUNTER */
+#endif /* MDB_DEBUG_AGG_INTEGRITY */
 
 	mdb_midl_free(env->me_pghead);
 	env->me_pghead = NULL;
@@ -8290,14 +8206,6 @@ ok:
 }
 #endif
 
-/** Find the address of the page corresponding to a given page number.
- * Set #MDB_TXN_ERROR on failure.
- * @param[in] mc the cursor accessing the page.
- * @param[in] pgno the page number for the page to retrieve.
- * @param[out] ret address of a pointer where the page's address will be stored.
- * @param[out] lvl dirty_list inheritance level of found page. 1=current txn, 0=mapped page.
- * @return 0 on success, non-zero on failure.
- */
 static int
 mdb_agg_check_page(MDB_cursor *mc, MDB_page *mp, const char *where)
 {
@@ -8327,6 +8235,14 @@ mdb_agg_check_page(MDB_cursor *mc, MDB_page *mp, const char *where)
 	return MDB_SUCCESS;
 }
 
+/** Find the address of the page corresponding to a given page number.
+ * Set #MDB_TXN_ERROR on failure.
+ * @param[in] mc the cursor accessing the page.
+ * @param[in] pgno the page number for the page to retrieve.
+ * @param[out] ret address of a pointer where the page's address will be stored.
+ * @param[out] lvl dirty_list inheritance level of found page. 1=current txn, 0=mapped page.
+ * @return 0 on success, non-zero on failure.
+ */
 static int
 mdb_page_get(MDB_cursor *mc, pgno_t pgno, MDB_page **ret, int *lvl)
 {
@@ -9547,7 +9463,7 @@ mdb_cursor_touch(MDB_cursor *mc)
 #define MDB_NOSPILL	0x8000
  
 /* -------------------------------------------------------------------------
- * Aggregate-branches debug helpers (enabled with MDB_DEBUG_COUNTER)
+ * Aggregate-branches debug helpers (enabled with MDB_DEBUG_AGG_PRINT)
  *
  * These are intentionally slow and verbose. They are meant to help pinpoint
  * where subtree counters become inconsistent during complex put paths
@@ -9556,7 +9472,7 @@ mdb_cursor_touch(MDB_cursor *mc)
  * The helpers below are *outer-cursor only* (they skip C_SUB), to avoid noise
  * from nested puts into dup-subpages/subDBs.
  * ------------------------------------------------------------------------- */
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_PRINT
 static uint64_t mdb_dbg_count_tree(MDB_cursor *mc, pgno_t root, int *rc, unsigned *mismatches);
 static uint64_t mdb_dbg_count_page(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatches);
 
@@ -9675,7 +9591,12 @@ mdb_dbg_cntdbg_pre(MDB_cursor *mc, const char *tag,
 	MDB_node *pn    = mdb_parent_find_node(pp, leafp->mp_pgno, mc->mc_ki[mc->mc_top - 1]);
 	uint64_t parent_before = pn ? mdb_node_get_count(pp, pn) : (uint64_t)-1;
 	uint64_t subtree_fast  = 0;
-	(void)mdb_page_subtree_entries(mc, leafp, &subtree_fast, MDB_AGG_SUBTREE_TOLERANT);
+	{
+		MDB_aggval a;
+		uint16_t agg = DB_AGGFLAGS(mc->mc_db);
+		(void)mdb_page_subtree_agg(mc, leafp, &a, MDB_AGG_SUBTREE_TOLERANT);
+		subtree_fast = mdb_agg_entries_get(agg, &a);
+	}
 
 	int trc = 0; unsigned mm = 0;
 	uint64_t subtree_dbg = mdb_dbg_count_page(mc, leafp, &trc, &mm);
@@ -9719,102 +9640,6 @@ mdb_dbg_cntdbg_pre(MDB_cursor *mc, const char *tag,
 	}
 }
 
-#if MDB_DEBUG_COUNTER
-/* Debug-only invariant checks for a DUPSORT leaf node that points to a dup container
- * (inline subpage or sub-DB). This helps catch aggregate/sub-DB linkage bugs close
- * to their origin, instead of only at the end-of-put global checker.
- */
-static int mdb_agg_add_leaf_node_full(MDB_cursor *mc, MDB_page *leaf, MDB_node *node, MDB_aggval *acc);
-
-static void
-mdb_dbg_assert_dupset_leaf_invariants(MDB_cursor *mc, MDB_node *leaf, MDB_cursor *mx, const char *where)
-{
-	/* Debug-only sanity for a dup container leaf:
-	 * The *effective* leaf contribution of the dup container (as computed by
-	 * leaf-node contribution logic) must match the aggregate of the dupset root.
-	 *
-	 * Note: aggregate prefixes are stored on *branch* nodes, not leaf nodes, so
-	 * we cannot validate a leaf-stored blob here. This check instead validates
-	 * that the dup-container accounting paths stay consistent during oscillation
-	 * between SUBPAGE and SUBDB representations.
-	 */
-	if (!mc || !leaf || !mx || !where)
-		return;
-	if (!HAS_AGG(mc->mc_db))
-		return;
-	if (!(leaf->mn_flags & (F_DUPDATA|F_SUBDATA)))
-		return;
-
-	uint16_t mcagg = DB_AGGFLAGS(mc->mc_db);
-	uint16_t mxagg = DB_AGGFLAGS(mx->mc_db);
-
-	/* Dup containers must use the same aggregate schema. */
-	if (mxagg != mcagg) {
-		DPRINTF(("[AGG DBG] %s: dup schema mismatch main=%#x sub=%#x",
-			where, (unsigned)mcagg, (unsigned)mxagg));
-		mdb_assert_fail(mc->mc_txn->mt_env, "dupset schema mismatch",
-		                mdb_func_, __FILE__, __LINE__);
-	}
-
-	MDB_aggval expected, contrib;
-	mdb_agg_zero(mcagg, &expected);
-	mdb_agg_zero(mcagg, &contrib);
-
-	/* Use the dupset's embedded O(1) totals as the source of truth.
-	 * For dup containers, the subcursor counts each dup value as a key; in the main
-	 * tree this leaf node represents a single user key, so normalize KEYS to 1 to match
-	 * leaf-node contribution semantics.
-	 */
-	if (mcagg & MDB_AGG_ENTRIES)
-		mdb_agg_entries_set(mcagg, &expected, (uint64_t)mx->mc_db->md_entries);
-	if (mcagg & MDB_AGG_KEYS)
-		mdb_agg_keys_set(mcagg, &expected, 1);
-	if (mcagg & MDB_AGG_HASHSUM)
-		memcpy(mdb_agg_hashsum_ptr(mcagg, &expected), mx->mc_db->md_hashsum, MDB_HASH_SIZE);
-	int arc = mdb_agg_add_leaf_node_full(mc, mc->mc_pg[mc->mc_top], leaf, &contrib);
-	if (arc) return;
-
-	if (memcmp(expected.v, contrib.v, mdb_agg_schema_size(mcagg)) != 0) {
-		size_t asz = mdb_agg_schema_size(mcagg);
-		size_t i;
-		DPRINTF(("[AGG DBG] %s: dup leaf aggregate mismatch (schema=%zu bytes)", where, asz));
-		for (i = 0; i < asz; i++)
-			DPRINTF(("[AGG DBG]  byte[%zu] got=%02x expected=%02x",
-				i, contrib.v[i], expected.v[i]));
-
-		if (mcagg & MDB_AGG_ENTRIES) {
-			uint64_t se = mdb_agg_entries_get(mcagg, &contrib);
-			uint64_t ee = mdb_agg_entries_get(mcagg, &expected);
-			uint64_t sk = mdb_agg_keys_get(mcagg, &contrib);
-			uint64_t ek = mdb_agg_keys_get(mcagg, &expected);
-			DPRINTF(("[AGG DBG]  entries got=%" PRIu64 " expected=%" PRIu64 " keys got=%" PRIu64 " expected=%" PRIu64,
-				se, ee, sk, ek));
-		}
-		mdb_assert_fail(mc->mc_txn->mt_env, "dupset leaf contribution mismatch",
-		                mdb_func_, __FILE__, __LINE__);
-	}
-
-	/* If this is a named sub-DB header leaf (F_SUBDATA), ensure the embedded
-	 * MDB_db header matches the live subcursor's header (root/depth/entries)
-	 * and that the aggregate schema matches.
-	 */
-	if (leaf->mn_flags & F_SUBDATA) {
-		MDB_db *db = (MDB_db *)NODEDATA(leaf);
-		if (db->md_root != mx->mc_db->md_root ||
-		    db->md_depth != mx->mc_db->md_depth ||
-		    db->md_entries != mx->mc_db->md_entries ||
-		    DB_AGGFLAGS(db) != mxagg) {
-			DPRINTF(("[AGG DBG] %s: subdb header mismatch hdr(root=%u depth=%u entries=%" PRIu64 " agg=%#x) sub(root=%u depth=%u entries=%" PRIu64 " agg=%#x)",
-				where,
-				(unsigned)db->md_root, (unsigned)db->md_depth, (uint64_t)db->md_entries, (unsigned)DB_AGGFLAGS(db),
-				(unsigned)mx->mc_db->md_root, (unsigned)mx->mc_db->md_depth, (uint64_t)mx->mc_db->md_entries, (unsigned)mxagg));
-			mdb_assert_fail(mc->mc_txn->mt_env, "subdb header mismatch",
-			                mdb_func_, __FILE__, __LINE__);
-		}
-	}
-}
-#endif /* MDB_DEBUG_COUNTER */
-
 static void
 mdb_dbg_cntdbg_post(MDB_cursor *mc, const char *tag)
 {
@@ -9834,7 +9659,7 @@ mdb_dbg_cntdbg_post(MDB_cursor *mc, const char *tag)
 
 /* Additional counted-put debug helpers for non-DUPSORT paths.
  * These are intentionally heavy and verbose; they are only compiled when
- * MDB_DEBUG_COUNTER is enabled, and should primarily be used around splits.
+ * MDB_DEBUG_AGG_PRINT is enabled, and should primarily be used around splits.
  */
 static indx_t
 mdb_dbg_find_child_index(MDB_page *pp, pgno_t child)
@@ -9983,7 +9808,7 @@ mdb_dbg_put_check_stack(MDB_cursor *mc, const char *tag)
 
 /* Additional counted-delete debug helpers.
  * These are intentionally heavy and verbose; they are only compiled when
- * MDB_DEBUG_COUNTER is enabled.
+ * MDB_DEBUG_AGG_PRINT is enabled.
  */
 static void
 mdb_dbg_del_dump_parent(MDB_cursor *mc, MDB_page *pp, const char *tag)
@@ -10139,7 +9964,119 @@ mdb_dbg_cntdbg_post(MDB_cursor *mc, const char *tag)
 {
 	(void)mc; (void)tag;
 }
-#endif
+#endif /* MDB_DEBUG_AGG_PRINT */
+
+/* Debug-only invariant checks for a DUPSORT leaf node that points to a dup container
+ * (inline subpage or sub-DB). This helps catch aggregate/sub-DB linkage bugs close
+ * to their origin, instead of only at the end-of-put global checker.
+ */
+#ifdef MDB_DEBUG_AGG_INTEGRITY
+static int mdb_agg_add_leaf_node_full(MDB_cursor *mc, MDB_page *leaf, MDB_node *node, MDB_aggval *acc);
+
+static void
+mdb_dbg_assert_dupset_leaf_invariants(MDB_cursor *mc, MDB_node *leaf, MDB_cursor *mx, const char *where)
+{
+	/* Debug-only sanity for a dup container leaf:
+	 * The *effective* leaf contribution of the dup container (as computed by
+	 * leaf-node contribution logic) must match the aggregate of the dupset root.
+	 *
+	 * Note: aggregate prefixes are stored on *branch* nodes, not leaf nodes, so
+	 * we cannot validate a leaf-stored blob here. This check instead validates
+	 * that the dup-container accounting paths stay consistent during oscillation
+	 * between SUBPAGE and SUBDB representations.
+	 */
+	if (!mc || !leaf || !mx || !where)
+		return;
+	if (!HAS_AGG(mc->mc_db))
+		return;
+	if (!(leaf->mn_flags & (F_DUPDATA | F_SUBDATA)))
+		return;
+
+	uint16_t mcagg = DB_AGGFLAGS(mc->mc_db);
+	uint16_t mxagg = DB_AGGFLAGS(mx->mc_db);
+
+	/* Dup containers must use the same aggregate schema. */
+	if (mxagg != mcagg) {
+		MDB_AGG_DBG_PRINTF("[AGG DBG] %s: dup schema mismatch main=%#x sub=%#x",
+			where, (unsigned)mcagg, (unsigned)mxagg);
+		mdb_assert_fail(mc->mc_txn->mt_env, "dupset schema mismatch",
+			            mdb_func_, __FILE__, __LINE__);
+	}
+
+	MDB_aggval expected, contrib;
+	mdb_agg_zero(mcagg, &expected);
+	mdb_agg_zero(mcagg, &contrib);
+
+	/* Use the dupset's embedded O(1) totals as the source of truth.
+	 * For dup containers, the subcursor counts each dup value as a key; in the main
+	 * tree this leaf node represents a single user key, so normalize KEYS to 1 to match
+	 * leaf-node contribution semantics.
+	 */
+	if (mcagg & MDB_AGG_ENTRIES)
+		mdb_agg_entries_set(mcagg, &expected, (uint64_t)mx->mc_db->md_entries);
+	if (mcagg & MDB_AGG_KEYS)
+		mdb_agg_keys_set(mcagg, &expected, 1);
+	if (mcagg & MDB_AGG_HASHSUM)
+		memcpy(mdb_agg_hashsum_ptr(mcagg, &expected), mx->mc_db->md_hashsum, MDB_HASH_SIZE);
+	int arc = mdb_agg_add_leaf_node_full(mc, mc->mc_pg[mc->mc_top], leaf, &contrib);
+	if (arc)
+		return;
+
+	if (memcmp(expected.v, contrib.v, mdb_agg_schema_size(mcagg)) != 0) {
+		size_t asz = mdb_agg_schema_size(mcagg);
+		size_t i;
+		MDB_AGG_DBG_PRINTF("[AGG DBG] %s: dup leaf aggregate mismatch (schema=%zu bytes)", where, asz);
+		for (i = 0; i < asz; i++)
+			MDB_AGG_DBG_PRINTF("[AGG DBG]  byte[%zu] got=%02x expected=%02x",
+				 i, contrib.v[i], expected.v[i]);
+
+		if (mcagg & MDB_AGG_ENTRIES) {
+#ifdef MDB_DEBUG_AGG_PRINT
+			uint64_t se = mdb_agg_entries_get(mcagg, &contrib);
+			uint64_t ee = mdb_agg_entries_get(mcagg, &expected);
+			uint64_t sk = mdb_agg_keys_get(mcagg, &contrib);
+			uint64_t ek = mdb_agg_keys_get(mcagg, &expected);
+			MDB_AGG_DBG_PRINTF("[AGG DBG]  entries got=%" PRIu64 " expected=%" PRIu64
+			        		   " keys got=%" PRIu64 " expected=%" PRIu64,
+			        			se, ee, sk, ek);
+#endif /* MDB_DEBUG_AGG_PRINT */
+		}
+		mdb_assert_fail(mc->mc_txn->mt_env, "dupset leaf contribution mismatch",
+			            mdb_func_, __FILE__, __LINE__);
+	}
+
+	/* If this is a named sub-DB header leaf (F_SUBDATA), ensure the embedded
+	 * MDB_db header matches the live subcursor's header (root/depth/entries)
+	 * and that the aggregate schema matches.
+	 */
+	if (leaf->mn_flags & F_SUBDATA) {
+		MDB_db *db = (MDB_db *)NODEDATA(leaf);
+		if (db->md_root != mx->mc_db->md_root ||
+		    db->md_depth != mx->mc_db->md_depth ||
+		    db->md_entries != mx->mc_db->md_entries ||
+		    DB_AGGFLAGS(db) != mxagg) {
+			MDB_AGG_DBG_PRINTF("[AGG DBG] %s: subdb header mismatch hdr(root=%u depth=%u entries=%" PRIu64
+			        " agg=%#x) sub(root=%u depth=%u entries=%" PRIu64 " agg=%#x)",
+			        where,
+			        (unsigned)db->md_root, (unsigned)db->md_depth, (uint64_t)db->md_entries,
+			        (unsigned)DB_AGGFLAGS(db),
+			        (unsigned)mx->mc_db->md_root, (unsigned)mx->mc_db->md_depth,
+			        (uint64_t)mx->mc_db->md_entries, (unsigned)mxagg);
+			mdb_assert_fail(mc->mc_txn->mt_env, "subdb header mismatch",
+			            mdb_func_, __FILE__, __LINE__);
+		}
+	}
+}
+#else
+static inline void
+mdb_dbg_assert_dupset_leaf_invariants(MDB_cursor *mc, MDB_node *leaf, MDB_cursor *mx, const char *where)
+{
+	(void)mc;
+	(void)leaf;
+	(void)mx;
+	(void)where;
+}
+#endif /* MDB_DEBUG_AGG_INTEGRITY */
 
 
 static inline int
@@ -10376,7 +10313,7 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 				mdb_hashsum_diff(diff2, newhs2, oldhs2);
 				if (mdb_hashsum_nonzero_buf(diff2)) {
 					mdb_agg_make_delta_ekhs(agg, &delta, 0, 0, diff2);
-					trc = mdb_adjust_agg_parents_ex(mc, mc->mc_pg[mc->mc_top], &delta, 0, 1);
+					trc = mdb_adjust_agg_parents(mc, mc->mc_pg[mc->mc_top], &delta, 0, 1);
 					if (trc)
 						return trc;
 					mdb_hashsum_add(mc->mc_db->md_hashsum, diff2);
@@ -10681,7 +10618,7 @@ current:
 					mdb_hashsum_diff(diff, newhs, oldhs);
 					if (mdb_hashsum_nonzero_buf(diff)) {
 						mdb_agg_make_delta_ekhs(agg, &delta, 0, 0, diff);
-						trc = mdb_adjust_agg_parents_ex(mc, mc->mc_pg[mc->mc_top], &delta, 0, 1);
+						trc = mdb_adjust_agg_parents(mc, mc->mc_pg[mc->mc_top], &delta, 0, 1);
 						if (trc)
 							return trc;
 						mdb_hashsum_add(mc->mc_db->md_hashsum, diff);
@@ -10720,7 +10657,7 @@ current:
 					mdb_hashsum_diff(diff2, newhs2, oldhs2);
 					if (mdb_hashsum_nonzero_buf(diff2)) {
 						mdb_agg_make_delta_ekhs(agg, &delta, 0, 0, diff2);
-						trc = mdb_adjust_agg_parents_ex(mc, mc->mc_pg[mc->mc_top], &delta, 0, 1);
+						trc = mdb_adjust_agg_parents(mc, mc->mc_pg[mc->mc_top], &delta, 0, 1);
 						if (trc)
 							return trc;
 						mdb_hashsum_add(mc->mc_db->md_hashsum, diff2);
@@ -10739,7 +10676,7 @@ current:
 				mdb_hashsum_diff(diff, newhs, oldhs);
 				if (mdb_hashsum_nonzero_buf(diff)) {
 					mdb_agg_make_delta_ekhs(agg, &delta, 0, 0, diff);
-					trc = mdb_adjust_agg_parents_ex(mc, mc->mc_pg[mc->mc_top], &delta, 0, 1);
+					trc = mdb_adjust_agg_parents(mc, mc->mc_pg[mc->mc_top], &delta, 0, 1);
 					if (trc)
 						return trc;
 					mdb_hashsum_add(mc->mc_db->md_hashsum, diff);
@@ -10761,7 +10698,7 @@ new_sub:
 			nflags &= ~MDB_APPEND; /* sub-page may need room to grow */
 		if (!insert_key)
 			nflags |= MDB_SPLIT_REPLACE;
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_PRINT
 		if (!(mc->mc_flags & C_SUB) && HAS_AGG(mc->mc_db)) {
 			mdb_dbg_put_dump_stack(mc, "pre_page_split", rc, split_performed, insert_key, insert_data, flags, nflags, nsize);
 			if (mc->mc_top)
@@ -10772,7 +10709,7 @@ new_sub:
 		rc = mdb_page_split(mc, key, rdata, P_INVALID, nflags);
 		if (rc == MDB_SUCCESS)
 			split_performed = 1;
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_PRINT
 		if (rc == MDB_SUCCESS && !(mc->mc_flags & C_SUB) && HAS_AGG(mc->mc_db)) {
 			mdb_dbg_put_dump_stack(mc, "post_page_split", rc, split_performed, insert_key, insert_data, flags, nflags, nsize);
 			if (mc->mc_top)
@@ -10939,9 +10876,7 @@ put_sub:
 			}
 			mdb_dbg_cntdbg_post(mc, "reconcile");
 			mdb_dbg_putsub_snapshot(mc, "after_reconcile", rc, (unsigned)flags, (unsigned)xflags, insert_key, (uint64_t)insert_data, split_performed, (uint64_t)ecount, leaf);
-#if MDB_DEBUG_COUNTER
 			mdb_dbg_assert_dupset_leaf_invariants(mc, leaf, &mc->mc_xcursor->mx_cursor, "put_sub_after_reconcile");
-#endif
 		}
 		/* Increment count unless we just replaced an existing item. */
 		if (insert_data)
@@ -11022,11 +10957,13 @@ put_sub:
 				mdb_hashsum_add(mc->mc_db->md_hashsum, hsdelta);
 		}
 
+		#ifdef MDB_DEBUG_AGG_INTEGRITY
 		if (!(mc->mc_db->md_flags & MDB_DUPSORT) && !insert_key && !do_sub && insert_data) {
-			fprintf(stderr, "[PUTCNT BUG] plain overwrite has insert_data=%d (should be 0)\n", insert_data);
+			MDB_AGG_DBG_PRINTF("[PUTCNT BUG] plain overwrite has insert_data=%d (should be 0)\n", insert_data);
 			fflush(stderr);
 			mdb_tassert(mc->mc_txn, insert_data == 0);
 		}
+		#endif
 
 		
 
@@ -11046,7 +10983,7 @@ put_sub:
 
 		if (((agg & MDB_AGG_ENTRIES) && entd) || ((agg & MDB_AGG_KEYS) && keyd) || have_hsdelta) {
 			mdb_agg_make_delta_ekhs(agg, &delta, entd, keyd, have_hsdelta ? hsdelta : NULL);
-			rc2 = mdb_adjust_agg_parents_ex(mc, mc->mc_pg[mc->mc_top], &delta, 0, 1);
+			rc2 = mdb_adjust_agg_parents(mc, mc->mc_pg[mc->mc_top], &delta, 0, 1);
 			if (rc2) {
 				rc = rc2;
 				goto bad_sub;
@@ -11067,7 +11004,8 @@ put_sub:
 		}
 	}
 
-#ifdef MDB_DEBUG_COUNTER
+
+#ifdef MDB_DEBUG_AGG_PRINT
 		if (HAS_AGG(mc->mc_db) && split_performed && !(mc->mc_flags & C_SUB)) {
 			mdb_dbg_put_check_stack(mc, "post_put_counts");
 			if (mc->mc_top)
@@ -11152,7 +11090,7 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
 	if (!IS_LEAF(mp))
 		return MDB_CORRUPTED;
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_PRINT
 	if (HAS_AGG(mc->mc_db) && !(mc->mc_flags & C_SUB)) {
 		int64_t removed_hint = -1;
 		if (IS_LEAF2(mp)) {
@@ -11187,7 +11125,7 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
 						MDB_aggval delta;
 						uint16_t agg = DB_AGGFLAGS(mc->mc_db);
 						mdb_agg_make_delta_ekhs(agg, &delta, 0, 0, hsbuf);
-						trc = mdb_adjust_agg_parents_ex(mc, mp, &delta, 1, 1);
+						trc = mdb_adjust_agg_parents(mc, mp, &delta, 1, 1);
 						if (trc)
 							return trc;
 					}
@@ -11260,24 +11198,23 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
 				if (have_dup_hs)
 					mdb_hashsum_sub(mc->mc_db->md_hashsum, dup_hs);
 				{
-				MDB_aggval delta;
-				uint16_t agg = DB_AGGFLAGS(mc->mc_db);
-				mdb_agg_make_delta_ekhs(agg, &delta, (uint64_t)1, 0,
-					have_dup_hs ? dup_hs : NULL);
-				int trc = mdb_adjust_agg_parents_ex(mc, mp, &delta, 1, 1);
-				if (trc)
-					return trc;
-			}
-				#ifdef MDB_DEBUG_COUNTER
+					MDB_aggval delta;
+					uint16_t agg = DB_AGGFLAGS(mc->mc_db);
+					mdb_agg_make_delta_ekhs(agg, &delta, (uint64_t)1, 0,
+						have_dup_hs ? dup_hs : NULL);
+					int trc = mdb_adjust_agg_parents(mc, mp, &delta, 1, 1);
+					if (trc)
+						return trc;
+				}
+#ifdef MDB_DEBUG_AGG_PRINT
 				if (HAS_AGG(mc->mc_db) && !(mc->mc_flags & C_SUB)) {
 					mdb_dbg_del_dump_stack(mc, "del_dupdata_sub_done", rc, flags, 1);
 					mdb_dbg_del_check_stack(mc, "del_dupdata_sub_done");
 				}
 #endif
-					return rc;
+				return rc;
 
 			} else {
-				// FIXME: check if this call to mdb_adjust_agg_parents() is needed
 				/*
 				 * Last DUPDATA item removed.
 				 *
@@ -11296,7 +11233,7 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
 					uint16_t agg = DB_AGGFLAGS(mc->mc_db);
 					mdb_agg_make_delta_ekhs(agg, &delta, (uint64_t)1, 0,
 						have_dup_hs ? dup_hs : NULL);
-					int trc = mdb_adjust_agg_parents_ex(mc, mp, &delta, 1, 1);
+					int trc = mdb_adjust_agg_parents(mc, mp, &delta, 1, 1);
 					if (trc)
 						return trc;
 				} else if (have_dup_hs) {
@@ -11306,7 +11243,7 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
 					MDB_aggval delta;
 					uint16_t agg = DB_AGGFLAGS(mc->mc_db);
 					mdb_agg_make_delta_ekhs(agg, &delta, 0, 0, dup_hs);
-					int trc = mdb_adjust_agg_parents_ex(mc, mp, &delta, 1, 1);
+					int trc = mdb_adjust_agg_parents(mc, mp, &delta, 1, 1);
 					if (trc)
 						return trc;
 				}
@@ -11341,7 +11278,7 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
     }
 
 del_key:
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_PRINT
 	if (HAS_AGG(mc->mc_db) && !(mc->mc_flags & C_SUB)) {
 		int64_t removed_hint = -1;
 		MDB_page *dmp = mc->mc_pg[mc->mc_top];
@@ -11370,7 +11307,8 @@ del_key:
 	            return frc;
 	        }
 	    }
-#ifdef MDB_DEBUG_COUNTER
+
+#ifdef MDB_DEBUG_AGG_PRINT
 		if (HAS_AGG(mc->mc_db) && !(mc->mc_flags & C_SUB)) {
 			mdb_dbg_del_dump_stack(mc, "del_post_del0", __rc, flags, 0);
 			mdb_dbg_del_check_stack(mc, "del_post_del0");
@@ -11596,31 +11534,30 @@ update:
 			memset(node->mn_data, 0, pfx);
 	}
 
-if (IS_BRANCH(mp) && PAGE_AGGFLAGS(mp)) {
-	MDB_aggval a;
-	uint16_t agg = PAGE_AGGFLAGS(mp);
-	if (child_subtree_agg) {
-		/* Caller already knows the subtree aggregate for this branch link.
-		 * Copy it directly instead of fetching the child page and
-		 * recomputing the subtree.
-		 */
-		a = *child_subtree_agg;
-	} else {
-		mdb_agg_zero(agg, &a);
-		if (pgno != P_INVALID && pgno != 0) {
-			MDB_page *cp;
-			int trc = mdb_page_get(mc, pgno, &cp, NULL);
-			if (trc)
-				return trc;
-			trc = mdb_page_subtree_agg(mc, cp, &a, MDB_AGG_SUBTREE_MAINT);
-			if (trc)
-				return trc;
+	if (IS_BRANCH(mp) && PAGE_AGGFLAGS(mp)) {
+		MDB_aggval a;
+		uint16_t agg = PAGE_AGGFLAGS(mp);
+		if (child_subtree_agg) {
+			/* Caller already knows the subtree aggregate for this branch link.
+			* Copy it directly instead of fetching the child page and
+			* recomputing the subtree. */
+			a = *child_subtree_agg;
+		} else {
+			mdb_agg_zero(agg, &a);
+			if (pgno != P_INVALID && pgno != 0) {
+				MDB_page *cp;
+				int trc = mdb_page_get(mc, pgno, &cp, NULL);
+				if (trc)
+					return trc;
+				trc = mdb_page_subtree_agg(mc, cp, &a, MDB_AGG_SUBTREE_MAINT);
+				if (trc)
+					return trc;
+			}
 		}
+		mdb_node_set_agg_blob(mp, node, &a);
+	} else {
+		mdb_node_set_count(mp, node, 0);
 	}
-	mdb_node_set_agg_blob(mp, node, &a);
-} else {
-	mdb_node_set_count(mp, node, 0);
-}
 	if (key)
 		memcpy(NODEKEY(mp, node), key->mv_data, key->mv_size);
 
@@ -12129,13 +12066,12 @@ mdb_update_key(MDB_cursor *mc, MDB_val *key)
 		}
 
 		base = (char *)mp + mp->mp_upper + PAGEBASE;
-		/* On aggregated branch pages, each branch node stores an extra uint64_t
-		 * subtree counter in mn_data[] before the key bytes. That prefix must
+		/* On aggregated branch pages, each branch node stores an extra aggregate data 
+		 * space mn_data[] before the key bytes. That prefix must
 		 * move together with the node header when we shift for key-size changes,
-		 * otherwise the counter becomes detached from its node.
+		 * otherwise the agg data becomes detached from its node.
 		 */
-		len = ptr - mp->mp_upper + NODESIZE
-		    + mdb_agg_prefix_bytes(mp);
+		len = ptr - mp->mp_upper + NODESIZE + mdb_agg_prefix_bytes(mp);
 		memmove(base - delta, base, len);
 		mp->mp_upper -= delta;
 
@@ -12440,7 +12376,7 @@ mdb_page_merge(MDB_cursor *csrc, MDB_cursor *cdst)
 	 * and apply it to the destination parent link (dst += src) after unlink.
 	 */
 	MDB_aggval	 srcAgg;
-	int		 have_srcAgg = 0;
+	int		     have_srcAgg = 0;
 	uint16_t	 agg = 0;
 	pgno_t		 src_pgno = 0, dst_pgno = 0;
 
@@ -12924,15 +12860,13 @@ mdb_cursor_del0(MDB_cursor *mc)
 		}
 	}
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_PRINT
 	if (HAS_AGG(mc->mc_db) && !(mc->mc_flags & C_SUB)) {
 		mdb_dbg_del_dump_stack(mc, "del0_enter", 0, 0, (int64_t)removed);
 		if (mc->mc_top)
 			mdb_dbg_del_dump_parent(mc, mc->mc_pg[mc->mc_top - 1], "del0_enter_parent");
 		mdb_dbg_del_check_stack(mc, "del0_enter");
 	}
-#endif
-#ifdef MDB_DEBUG_COUNTER
 	uint64_t entries_before = mc->mc_db->md_entries;
 #endif
 	mdb_node_del(mc, mc->mc_db->md_pad);
@@ -12944,15 +12878,14 @@ mdb_cursor_del0(MDB_cursor *mc)
 	{
 		MDB_aggval delta;
 		mdb_agg_make_delta_ekhs(agg, &delta, (uint64_t)removed, 1, have_hs ? hsbuf : NULL);
-		rc = mdb_adjust_agg_parents_ex(mc, mp, &delta, 1, 1);
+		rc = mdb_adjust_agg_parents(mc, mp, &delta, 1, 1);
 	}
 	if (rc)
 		return rc;
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_PRINT
 	if (HAS_AGG(mc->mc_db) && !(mc->mc_flags & C_SUB)) {
-		fprintf(stderr,
-			"[DELCNT del0_post_adjust] removed=%"PRIu64" md_entries_before=%"PRIu64" md_entries_after=%"PRIu64"\n",
-			(uint64_t)removed, (uint64_t)entries_before, (uint64_t)mc->mc_db->md_entries);
+		MDB_AGG_DBG_PRINTF("[DELCNT del0_post_adjust] removed=%"PRIu64" md_entries_before=%"PRIu64" md_entries_after=%"PRIu64"\n",
+						   (uint64_t)removed, (uint64_t)entries_before, (uint64_t)mc->mc_db->md_entries);
 		mdb_dbg_del_check_stack(mc, "del0_post_adjust");
 		if (mc->mc_top)
 			mdb_dbg_del_dump_parent(mc, mc->mc_pg[mc->mc_top - 1], "del0_post_adjust_parent");
@@ -12993,7 +12926,7 @@ mdb_cursor_del0(MDB_cursor *mc)
 		}
 	}
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_PRINT
 	if (HAS_AGG(mc->mc_db) && !(mc->mc_flags & C_SUB)) {
 		mdb_dbg_del_dump_stack(mc, "del0_post_rebalance", rc, 0, 0);
 		mdb_dbg_del_check_stack(mc, "del0_post_rebalance");
@@ -13062,7 +12995,7 @@ mdb_cursor_del0(MDB_cursor *mc)
 		}
 	}
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_PRINT
 	if (HAS_AGG(mc->mc_db) && !(mc->mc_flags & C_SUB)) {
 		mdb_dbg_del_check_stack(mc, "del0_exit");
 	}
@@ -13111,7 +13044,7 @@ mdb_del(MDB_txn *txn, MDB_dbi dbi,
 		data ? mdb_dval(txn, dbi, data, dbuf):""));
 	{
 		int rc = mdb_del0(txn, dbi, key, data, 0);
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 		if (rc == MDB_SUCCESS && (txn->mt_env->me_flags & MDB_AGG_CHECK)) {
 			int crc = mdb_dbg_check_agg_txn_all(txn);
 			if (crc != MDB_SUCCESS) {
@@ -13119,7 +13052,7 @@ mdb_del(MDB_txn *txn, MDB_dbi dbi,
 				return crc;
 			}
 		}
-#endif /* MDB_DEBUG_COUNTER */
+#endif /* MDB_DEBUG_AGG_INTEGRITY */
 		return rc;
 	}
 }
@@ -13513,7 +13446,6 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 		memcpy(NODEPTR(mp, nkeys-1), NODEPTR(copy, nkeys-1),
 			env->me_psize - copy->mp_upper - PAGEBASE);
 
-
 		/* reset back to original page */
 		if (newindx < split_indx) {
 			mc->mc_pg[mc->mc_top] = mp;
@@ -13604,7 +13536,6 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 				XCURSOR_REFRESH(m3, mc->mc_top, m3->mc_pg[mc->mc_top]);
 		}
 	}
-	
 
 	/* Aggregate-branches split repair:
 	 * Refresh sibling link-counts (mp/rp) in all plausible parents and
@@ -13618,9 +13549,6 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata, pgno_t newpgno
 			goto done;
 		}
 	}
-
-
-
 
 	DPRINTF(("mp left: %d, rp left: %d", SIZELEFT(mp), SIZELEFT(rp)));
 
@@ -13651,7 +13579,6 @@ mdb_put(MDB_txn *txn, MDB_dbi dbi,
 	if (txn->mt_flags & (MDB_TXN_RDONLY|MDB_TXN_BLOCKED))
 		return (txn->mt_flags & MDB_TXN_RDONLY) ? EACCES : MDB_BAD_TXN;
 
-
 	/* HASHSUM aggregates assume stored value bytes are immutable. Under MDB_WRITEMAP the
 	 * database contents are mapped writable in-process, so callers could modify values
 	 * without going through LMDB and silently corrupt aggregates. We therefore reject
@@ -13662,7 +13589,6 @@ mdb_put(MDB_txn *txn, MDB_dbi dbi,
 	if (rc)
 		return rc;
 
-
 	MDB_TRACE(("%p, %u, %"Z"u[%s], %"Z"u%s, %u",
 		txn, dbi, key ? key->mv_size:0, DKEY(key), data->mv_size, mdb_dval(txn, dbi, data, dbuf), flags));
 	mdb_cursor_init(&mc, txn, dbi, &mx);
@@ -13670,7 +13596,8 @@ mdb_put(MDB_txn *txn, MDB_dbi dbi,
 	txn->mt_cursors[dbi] = &mc;
 	rc = _mdb_cursor_put(&mc, key, data, flags);
 	txn->mt_cursors[dbi] = mc.mc_next;
-#ifdef MDB_DEBUG_COUNTER
+
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 	if (rc == MDB_SUCCESS && (txn->mt_env->me_flags & MDB_AGG_CHECK)) {
 		int crc = mdb_dbg_check_agg_txn_all(txn);
 		if (crc != MDB_SUCCESS) {
@@ -13679,7 +13606,7 @@ mdb_put(MDB_txn *txn, MDB_dbi dbi,
 			return crc;
 		}
 	}
-#endif /* MDB_DEBUG_COUNTER */
+#endif /* MDB_DEBUG_AGG_INTEGRITY */
 	return rc;
 }
 
@@ -15485,7 +15412,7 @@ mdb_agg_prefix_key_cursor(MDB_cursor *cur, const MDB_val *key, unsigned incl,
 			int rc_tot = mdb_agg_totals_cursor(cur, out);
 			if (!rc_tot && any_out && (agg & MDB_AGG_ENTRIES)) {
 				uint64_t e = mdb_agg_entries_get(agg, out);
-				mdb_tassert(cur->mc_txn, ((*any_out == 0) && (e == 0)) || ((*any_out != 0) && (e != 0)));
+				mdb_tassert(cur->mc_txn, ((*any_out == 0) && (e == 0)) || ((*any_out != 0) && (e != 0))); (void)e;
 			}
 			return rc_tot;
 		}
@@ -15612,12 +15539,12 @@ mdb_agg_prefix_key_cursor(MDB_cursor *cur, const MDB_val *key, unsigned incl,
 	if (any_out) {
 		if (agg & MDB_AGG_ENTRIES) {
 			uint64_t e = mdb_agg_entries_get(agg, out);
-			mdb_tassert(cur->mc_txn, ((*any_out == 0) && (e == 0)) || ((*any_out != 0) && (e != 0)));
+			mdb_tassert(cur->mc_txn, ((*any_out == 0) && (e == 0)) || ((*any_out != 0) && (e != 0))); (void)e;
 		}
 		if ((agg & MDB_AGG_KEYS) && (agg & MDB_AGG_ENTRIES)) {
 			uint64_t e = mdb_agg_entries_get(agg, out);
 			uint64_t kcnt = mdb_agg_keys_get(agg, out);
-			mdb_tassert(cur->mc_txn, (e == 0) ? (kcnt == 0) : (kcnt != 0));
+			mdb_tassert(cur->mc_txn, (e == 0) ? (kcnt == 0) : (kcnt != 0)); (void)e; (void)kcnt;
 		}
 		if ((agg & MDB_AGG_HASHSUM) && (*any_out == 0)) {
 			mdb_tassert(cur->mc_txn, mdb_agg_hashsum_is_zero(agg, out));
@@ -16154,29 +16081,29 @@ mdb_agg_range_key_internal_public(MDB_txn *txn, MDB_dbi dbi,
 	upper_incl = !!(flags & MDB_RANGE_UPPER_INCL);
 
 
-		// /* Empty range quick check for record-order ranges (best-effort).
-		//  *
-		//  * We can cheaply detect some empty cases when both keys exist and either
-		//  * (a) keys are out of order, or (b) both bounds include data for the same key.
-		//  * Other cases (e.g. key-only vs (key,data) within the same key) are handled
-		//  * later by prefix-diff underflow clamping.
-		//  */
-		// if (low_key && high_key) {
-		// 	int kcmp = mdb_cmp(txn, dbi, (MDB_val *)low_key, (MDB_val *)high_key);
-		// 	if (kcmp > 0) {
-		// 		mdb_agg_zero_public(schema, out);
-		// 		out->mv_flags = (unsigned)agg;
-		// 		return MDB_SUCCESS;
-		// 	}
-		// 	if (kcmp == 0 && low_data && high_data) {
-		// 		int dcmp = mdb_dcmp(txn, dbi, (MDB_val *)low_data, (MDB_val *)high_data);
-		// 		if (dcmp > 0 || (dcmp == 0 && !(lower_incl && upper_incl))) {
-		// 			mdb_agg_zero_public(schema, out);
-		// 			out->mv_flags = (unsigned)agg;
-		// 			return MDB_SUCCESS;
-		// 		}
-		// 	}
-		// }
+	// /* Empty range quick check for record-order ranges (best-effort).
+	//  *
+	//  * We can cheaply detect some empty cases when both keys exist and either
+	//  * (a) keys are out of order, or (b) both bounds include data for the same key.
+	//  * Other cases (e.g. key-only vs (key,data) within the same key) are handled
+	//  * later by prefix-diff underflow clamping.
+	//  */
+	// if (low_key && high_key) {
+	// 	int kcmp = mdb_cmp(txn, dbi, (MDB_val *)low_key, (MDB_val *)high_key);
+	// 	if (kcmp > 0) {
+	// 		mdb_agg_zero_public(schema, out);
+	// 		out->mv_flags = (unsigned)agg;
+	// 		return MDB_SUCCESS;
+	// 	}
+	// 	if (kcmp == 0 && low_data && high_data) {
+	// 		int dcmp = mdb_dcmp(txn, dbi, (MDB_val *)low_data, (MDB_val *)high_data);
+	// 		if (dcmp > 0 || (dcmp == 0 && !(lower_incl && upper_incl))) {
+	// 			mdb_agg_zero_public(schema, out);
+	// 			out->mv_flags = (unsigned)agg;
+	// 			return MDB_SUCCESS;
+	// 		}
+	// 	}
+	// }
 	/* Empty range quick check when both bounds are present. */
 	if (low && high) {
 		int cmp = mdb_cmp(txn, dbi, (MDB_val *)low, (MDB_val *)high);
@@ -16209,7 +16136,7 @@ mdb_agg_range_key_internal_public(MDB_txn *txn, MDB_dbi dbi,
 	mdb_agg_from_internal(agg, &a_lo, &tmp_lo);
 
 	mdb_agg_zero_public(schema, out);
-if (agg & MDB_AGG_ENTRIES) {
+	if (agg & MDB_AGG_ENTRIES) {
 		if (tmp_hi.mv_agg_entries < tmp_lo.mv_agg_entries) {
 			/* Empty / inverted record-order range. Mirror mdb_agg_range() semantics. */
 			mdb_agg_zero_public(schema, out);
@@ -16618,7 +16545,7 @@ mdb_agg_range(MDB_txn *txn, MDB_dbi dbi,
 	mdb_agg_from_internal(agg, &a_lo, &tmp_lo);
 
 	mdb_agg_zero_public(schema, out);
-if (agg & MDB_AGG_ENTRIES) {
+	if (agg & MDB_AGG_ENTRIES) {
 		if (tmp_hi.mv_agg_entries < tmp_lo.mv_agg_entries) {
 			/* Inverted / empty record-order range: return empty aggregates. */
 			mdb_agg_zero_public(schema, out);
@@ -17216,7 +17143,8 @@ mdb_agg_window_fingerprint(MDB_txn *txn, MDB_dbi dbi,
 }
 
 
-/* Compute the lower-bound entry-rank of (key,data) within a cached window and return a relative rank. */
+/* Compute the lower-bound entry-rank of (key,data) within a cached window 
+ * and return a relative rank. */
 int ESECT
 mdb_agg_window_rank(MDB_txn *txn, MDB_dbi dbi,
 					const MDB_val *low_key, const MDB_val *low_data,
@@ -17323,7 +17251,7 @@ mdb_agg_window_rank(MDB_txn *txn, MDB_dbi dbi,
 }
 
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_ANY
 
 /* Forward: internal page fetch in LMDB core */
 static int mdb_page_get(MDB_cursor *mc, pgno_t pgno, MDB_page **mp, int *lvl);
@@ -17341,7 +17269,9 @@ typedef struct MDB_dbg_ek {
 static MDB_dbg_ek
 mdb_dbg_count_page_ek(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatches);
 
+#ifdef MDB_DEBUG_AGG_PRINT
 static void mdb_dbg_fprint_hex(FILE *fp, const uint8_t *p, size_t n);
+#endif
 
 /* Count records+keys in the tree rooted at pgno, and validate stored child aggregates on aggregate branches. */
 static MDB_dbg_ek
@@ -17405,7 +17335,7 @@ mdb_dbg_leaf_node_agg(MDB_cursor *mc, MDB_page *leaf, MDB_node *node,
 				/* values-as-keys */
 				if (NODEKSZ(node) < MDB_HASH_NEED(mc->mc_db)) {
 					(*mismatches)++;
-					fprintf(stderr, "[AGG HASHSUM VALSIZE] dup-sub value size=%u < MDB_HASH_SIZE=%u\n",
+					MDB_AGG_DBG_PRINTF("[AGG HASHSUM VALSIZE] dup-sub value size=%u < MDB_HASH_SIZE=%u\n",
 						(unsigned)NODEKSZ(node), (unsigned)MDB_HASH_SIZE);
 				} else {
 					mdb_hashsum_add(out.hashsum, (const uint8_t *)NODEKEY(leaf, node) + mc->mc_db->md_hash_offset);
@@ -17417,7 +17347,7 @@ mdb_dbg_leaf_node_agg(MDB_cursor *mc, MDB_page *leaf, MDB_node *node,
 					return (MDB_dbg_ek){0,0,{0}};
 				if (vv.mv_size < MDB_HASH_NEED(mc->mc_db)) {
 					(*mismatches)++;
-					fprintf(stderr, "[AGG HASHSUM VALSIZE] value size=%"Z"u < MDB_HASH_SIZE=%u\n",
+					MDB_AGG_DBG_PRINTF("[AGG HASHSUM VALSIZE] value size=%"Z"u < MDB_HASH_SIZE=%u\n",
 						vv.mv_size, (unsigned)MDB_HASH_SIZE);
 				} else {
 					mdb_hashsum_add(out.hashsum, (const uint8_t *)vv.mv_data + mc->mc_db->md_hash_offset);
@@ -17474,12 +17404,14 @@ mdb_dbg_count_page_ek(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatche
 		if (DB_AGGFLAGS(mc->mc_db) & MDB_AGG_HASHSUM) {
 			if (!(mc->mc_flags & C_SUB)) {
 				(*mismatches)++;
-					fprintf(stderr, "[AGG HASHSUM UNSUPPORTED] hashsum on LEAF2 without C_SUB (pgno=%"Yu")\n",
-						mp->mp_pgno);
+				MDB_AGG_DBG_PRINTF(
+					"[AGG HASHSUM UNSUPPORTED] hashsum on LEAF2 without C_SUB (pgno=%"Yu")\n",
+					mp->mp_pgno);
 			} else if ((size_t)mp->mp_pad < MDB_HASH_NEED(mc->mc_db)) {
 				(*mismatches)++;
-					fprintf(stderr, "[AGG HASHSUM VALSIZE] LEAF2 ksize=%u < MDB_HASH_SIZE=%u (pgno=%"Yu")\n",
-						(unsigned)mp->mp_pad, (unsigned)MDB_HASH_SIZE, mp->mp_pgno);
+				MDB_AGG_DBG_PRINTF(
+					"[AGG HASHSUM VALSIZE] LEAF2 ksize=%u < MDB_HASH_SIZE=%u (pgno=%"Yu")\n",
+					(unsigned)mp->mp_pad, (unsigned)MDB_HASH_SIZE, mp->mp_pgno);
 			} else {
 				for (i = 0; i < n; i++) {
 					const uint8_t *p = (const uint8_t *)LEAF2KEY(mp, i, mp->mp_pad);
@@ -17509,13 +17441,13 @@ mdb_dbg_count_page_ek(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatche
 	{
 		indx_t i, n = NUMKEYS(mp);
 		uint16_t agg = PAGE_AGGFLAGS(mp);
-			uint16_t want = DB_AGGFLAGS(mc->mc_db);
-			if (agg != want) {
-				(*mismatches)++;
-				fprintf(stderr,
-					"[AGG PAGE SCHEMA MISMATCH] pgno=%"Yu" page_agg=0x%x db_agg=0x%x\n",
-					mp->mp_pgno, (unsigned)agg, (unsigned)want);
-			}
+		uint16_t want = DB_AGGFLAGS(mc->mc_db);
+		if (agg != want) {
+			(*mismatches)++;
+			MDB_AGG_DBG_PRINTF(
+				"[AGG PAGE SCHEMA MISMATCH] pgno=%"Yu" page_agg=0x%x db_agg=0x%x\n",
+				mp->mp_pgno, (unsigned)agg, (unsigned)want);
+		}
 
 
 		for (i = 0; i < n; i++) {
@@ -17538,17 +17470,17 @@ mdb_dbg_count_page_ek(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatche
 					uint64_t se = mdb_agg_entries_get(agg, &stored);
 					if (se != child.entries) {
 						(*mismatches)++;
-						fprintf(stderr,
+						MDB_AGG_DBG_PRINTF(
 							"[AGG ENTRIES MISMATCH] parent pgno=%"Yu" idx=%u child pgno=%"Yu
 							" stored=%" PRIu64 " computed=%" PRIu64 "\n",
 							mp->mp_pgno, (unsigned)i, child_pgno, se, child.entries);
 					}
 				}
-									if (agg & MDB_AGG_KEYS) {
+					if (agg & MDB_AGG_KEYS) {
 						uint64_t sk = mdb_agg_keys_get(agg, &stored);
 						if (sk != child.keys) {
 							(*mismatches)++;
-							fprintf(stderr,
+							MDB_AGG_DBG_PRINTF(
 								"[AGG KEYS MISMATCH] parent pgno=%"Yu" idx=%u child pgno=%"Yu
 								" stored=%" PRIu64 " computed=%" PRIu64 "\n",
 								mp->mp_pgno, (unsigned)i, child_pgno, sk, child.keys);
@@ -17558,13 +17490,17 @@ mdb_dbg_count_page_ek(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatche
 						const uint8_t *sh = mdb_agg_hashsum_ptr_ro(agg, &stored);
 						if (memcmp(sh, child.hashsum, MDB_HASH_SIZE) != 0) {
 							(*mismatches)++;
-							fprintf(stderr,
+							MDB_AGG_DBG_PRINTF(
 								"[AGG HASHSUM MISMATCH] parent pgno=%"Yu" idx=%u child pgno=%"Yu" stored=",
 								mp->mp_pgno, (unsigned)i, child_pgno);
+							#ifdef MDB_DEBUG_AGG_PRINT
 							mdb_dbg_fprint_hex(stderr, sh, MDB_HASH_SIZE);
 							fprintf(stderr, " computed=");
 							mdb_dbg_fprint_hex(stderr, child.hashsum, MDB_HASH_SIZE);
 							fprintf(stderr, "\n");
+							#else
+							MDB_AGG_DBG_PRINTF("\n");
+							#endif
 						}
 					}
 				}
@@ -17586,6 +17522,7 @@ mdb_dbg_count_page(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatches)
 	return ek.entries;
 }
 
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 static int
 mdb_dbg_cursor_count_all(MDB_txn *txn, MDB_dbi dbi, uint64_t *out)
 {
@@ -17610,6 +17547,9 @@ mdb_dbg_cursor_count_all(MDB_txn *txn, MDB_dbi dbi, uint64_t *out)
 
 }
 
+#endif /* MDB_DEBUG_AGG_INTEGRITY */
+
+#ifdef MDB_DEBUG_AGG_PRINT
 static void
 mdb_dbg_fprint_hex(FILE *fp, const uint8_t *p, size_t n)
 {
@@ -17617,7 +17557,9 @@ mdb_dbg_fprint_hex(FILE *fp, const uint8_t *p, size_t n)
 	for (i = 0; i < n; i++)
 		fprintf(fp, "%02x", (unsigned)p[i]);
 }
+#endif /* MDB_DEBUG_AGG_PRINT */
 
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 static int
 mdb_dbg_cursor_hashsum_all(MDB_txn *txn, MDB_dbi dbi, uint8_t out[MDB_HASH_SIZE])
 {
@@ -17709,7 +17651,8 @@ mdb_dbg_check_agg_db(MDB_txn *txn, MDB_dbi dbi)
 
 	if (computed_entries != db->md_entries) {
 		mism++;
-		fprintf(stderr, "[AGG TOTAL ENTRIES MISMATCH] dbi=%u md_entries=%" PRIu64 " computed=%" PRIu64 "\n",
+		MDB_AGG_DBG_PRINTF(
+			"[AGG TOTAL ENTRIES MISMATCH] dbi=%u md_entries=%" PRIu64 " computed=%" PRIu64 "\n",
 			(unsigned)dbi, (uint64_t)db->md_entries, computed_entries);
 	}
 
@@ -17719,12 +17662,13 @@ mdb_dbg_check_agg_db(MDB_txn *txn, MDB_dbi dbi)
 		nrc = mdb_dbg_cursor_count_all(txn, dbi, &naive);
 		if (nrc) {
 			mism++;
-			fprintf(stderr, "[AGG NAIVE ENTRIES ERROR] dbi=%u rc=%d\n", (unsigned)dbi, nrc);
+			MDB_AGG_DBG_PRINTF("[AGG NAIVE ENTRIES ERROR] dbi=%u rc=%d\n", (unsigned)dbi, nrc);
 			return nrc;
 		}
 		if (naive != db->md_entries) {
 			mism++;
-			fprintf(stderr, "[AGG NAIVE ENTRIES MISMATCH] dbi=%u md_entries=%" PRIu64 " naive=%" PRIu64 "\n",
+			MDB_AGG_DBG_PRINTF(
+				"[AGG NAIVE ENTRIES MISMATCH] dbi=%u md_entries=%" PRIu64 " naive=%" PRIu64 "\n",
 				(unsigned)dbi, (uint64_t)db->md_entries, naive);
 		}
 	}
@@ -17735,16 +17679,20 @@ mdb_dbg_check_agg_db(MDB_txn *txn, MDB_dbi dbi)
 		int hrc = mdb_dbg_cursor_hashsum_all(txn, dbi, naive_hs);
 		if (hrc) {
 			mism++;
-			fprintf(stderr, "[AGG NAIVE HASHSUM ERROR] dbi=%u rc=%d\n", (unsigned)dbi, hrc);
+			MDB_AGG_DBG_PRINTF("[AGG NAIVE HASHSUM ERROR] dbi=%u rc=%d\n", (unsigned)dbi, hrc);
 			return hrc;
 		}
 		if (memcmp(naive_hs, computed_hs, MDB_HASH_SIZE) != 0) {
 			mism++;
-			fprintf(stderr, "[AGG NAIVE HASHSUM MISMATCH] dbi=%u computed=", (unsigned)dbi);
+			MDB_AGG_DBG_PRINTF("[AGG NAIVE HASHSUM MISMATCH] dbi=%u computed=", (unsigned)dbi);
+			#ifdef MDB_DEBUG_AGG_PRINT
 			mdb_dbg_fprint_hex(stderr, computed_hs, MDB_HASH_SIZE);
 			fprintf(stderr, " naive=");
 			mdb_dbg_fprint_hex(stderr, naive_hs, MDB_HASH_SIZE);
 			fprintf(stderr, "\n");
+			#else
+			MDB_AGG_DBG_PRINTF("\n");
+			#endif
 		}
 	}
 
@@ -17758,7 +17706,7 @@ mdb_dbg_check_agg_db(MDB_txn *txn, MDB_dbi dbi)
 		krc = mdb_cursor_open(txn, dbi, &cur);
 		if (krc != MDB_SUCCESS) {
 			mism++;
-			fprintf(stderr, "[AGG NAIVE KEYS ERROR] dbi=%u rc=%d\n", (unsigned)dbi, krc);
+			MDB_AGG_DBG_PRINTF("[AGG NAIVE KEYS ERROR] dbi=%u rc=%d\n", (unsigned)dbi, krc);
 			return krc;
 		}
 
@@ -17771,14 +17719,15 @@ mdb_dbg_check_agg_db(MDB_txn *txn, MDB_dbi dbi)
 		if (krc != MDB_NOTFOUND) {
 			mdb_cursor_close(cur);
 			mism++;
-			fprintf(stderr, "[AGG NAIVE KEYS ERROR] dbi=%u rc=%d\n", (unsigned)dbi, krc);
+			MDB_AGG_DBG_PRINTF("[AGG NAIVE KEYS ERROR] dbi=%u rc=%d\n", (unsigned)dbi, krc);
 			return krc;
 		}
 		mdb_cursor_close(cur);
 
 		if (naive_keys != computed_keys) {
 			mism++;
-			fprintf(stderr, "[AGG NAIVE KEYS MISMATCH] dbi=%u computed_keys=%" PRIu64 " naive_keys=%" PRIu64 "\n",
+			MDB_AGG_DBG_PRINTF(
+				"[AGG NAIVE KEYS MISMATCH] dbi=%u computed_keys=%" PRIu64 " naive_keys=%" PRIu64 "\n",
 				(unsigned)dbi, computed_keys, naive_keys);
 		}
 	}
@@ -17819,7 +17768,9 @@ mdb_dbg_check_agg_txn_all(MDB_txn *txn)
 	return MDB_SUCCESS;
 }
 
-#endif /* MDB_DEBUG_COUNTER */
+#endif /* MDB_DEBUG_AGG_INTEGRITY */
+
+#endif /* MDB_DEBUG_AGG_ANY */
 
 
 /** Add all the DB's pages to the free list.
@@ -17945,13 +17896,10 @@ int mdb_drop(MDB_txn *txn, MDB_dbi dbi, int del)
 	if (F_ISSET(txn->mt_flags, MDB_TXN_RDONLY))
 		return EACCES;
 
-
-
 	/* Enforce HASHSUM write policy (WRITEMAP/RESERVE) consistently. */
 	rc = mdb_hashsum_write_policy_check(txn, &txn->mt_dbs[dbi], 0);
 	if (rc)
 		return rc;
-
 
 	if (TXN_DBI_CHANGED(txn, dbi))
 		return MDB_BAD_DBI;

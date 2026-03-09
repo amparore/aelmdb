@@ -15,7 +15,7 @@
  *
  * Build (example):
  *   cc -O2 -std=c99 -I. mtest_unit_keyhash.c mdb.c midl.c -o mtest_unit_keyhash
- *   cc -g -std=c99 -DMDB_DEBUG_COUNTER -DMDB_DEBUG -I. mtest_unit_keyhash.c mdb.c midl.c -o mtest_unit_keyhash
+ *   cc -g -std=c99 -DMDB_DEBUG_AGG_PRINT -DMDB_DEBUG_AGG_INTEGRITY -DMDB_DEBUG -I. mtest_unit_keyhash.c mdb.c midl.c -o mtest_unit_keyhash
  */
 
 #include "lmdb.h"
@@ -45,7 +45,7 @@
     }                                                                           \
 } while (0)
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 #define DBG_CHECK(txn, dbi, msg) do { CHECK(mdb_dbg_check_agg_db((txn), (dbi)), (msg)); } while (0)
 #else
 #define DBG_CHECK(txn, dbi, msg) do { (void)(txn); (void)(dbi); (void)(msg); } while (0)

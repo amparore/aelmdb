@@ -18,8 +18,8 @@ WARN    ?= -W -Wall -Wno-unused-parameter -Wbad-function-cast -Wuninitialized
 CXXWARN ?= $(filter-out -Wbad-function-cast,$(WARN))
 
 # Default to debug-friendly options used in this repo.
-# OPT      ?= -g -DMDB_DEBUG_COUNTER
-# OPT     ?= -g -DMDB_DEBUG_COUNTER -DMDB_DEBUG
+# OPT      ?= -g -DMDB_DEBUG_AGG_PRINT -DMDB_DEBUG_AGG_INTEGRITY -DMDB_DEBUG
+# OPT      ?= -g -DMDB_DEBUG_AGG_INTEGRITY
 OPT     ?= -O3 -DNDEBUG
 # OPT      ?= -g -pg
 

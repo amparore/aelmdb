@@ -8,11 +8,11 @@
  *   - MDB_AGG_HASHSUM  : wraparound sum of first MDB_HASH_SIZE bytes of each value
  *
  * After every modifying operation we invoke the aggregate debug checker when
- * compiled with MDB_DEBUG_COUNTER.
+ * compiled with MDB_DEBUG_AGG_INTEGRITY.
  *
  * Build (example):
  *   cc -O2 -std=c99 -I. mtest_unit.c mdb.c midl.c -o mtest_unit
- *   cc -g -std=c99 -DMDB_DEBUG_COUNTER -DMDB_DEBUG -I. mtest_unit.c mdb.c midl.c -o mtest_unit
+ *   cc -g -std=c99 -DMDB_DEBUG_AGG_PRINT -DMDB_DEBUG_AGG_INTEGRITY -DMDB_DEBUG -I. mtest_unit.c mdb.c midl.c -o mtest_unit
  */
 
 #include "lmdb.h"
@@ -46,7 +46,7 @@
     }                                                                           \
 } while (0)
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 #define DBG_CHECK(txn, dbi, msg) do { CHECK(mdb_dbg_check_agg_db((txn), (dbi)), (msg)); } while (0)
 #else
 #define DBG_CHECK(txn, dbi, msg) do { (void)(txn); (void)(dbi); (void)(msg); } while (0)
@@ -292,7 +292,7 @@ static MDB_env *open_env_dir(const char *dir, int maxdbs, size_t mapsize, int fr
     /* Fast test defaults. Optionally enable internal aggregate checks. */
     {
         unsigned int eflags = MDB_NOLOCK | MDB_NOSYNC | MDB_NOMETASYNC;
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
         eflags |= MDB_AGG_CHECK;
 #endif
         CHECK(mdb_env_open(env, dir, eflags, 0664), "mdb_env_open");
@@ -318,7 +318,7 @@ static MDB_env *open_env_dir_flags(const char *dir, int maxdbs, size_t mapsize, 
 
     {
         unsigned int eflags = MDB_NOLOCK | MDB_NOSYNC | MDB_NOMETASYNC | extra_eflags;
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
         eflags |= MDB_AGG_CHECK;
 #endif
         CHECK(mdb_env_open(env, dir, eflags, 0664), "mdb_env_open");
@@ -1106,7 +1106,7 @@ static void verify_against_oracle_randomized(MDB_txn *txn, MDB_dbi dbi, const ch
     size_t trials = 120;
     if (vv->len < 40) trials = 40;
     if (vv->len > 5000) trials = 80;
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
     if (trials > 80) trials = 80;
 #endif
 
@@ -1946,7 +1946,7 @@ static void test_plain_deep_split_merge_oscillation(void)
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "plain deep osc: begin");
     CHECK(mdb_dbi_open(txn, "plain", MDB_CREATE | AGG_SCHEMA, &dbi), "plain deep osc: open");
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
     const unsigned N = 1600;
     const unsigned CYCLES = 2;
 #else
@@ -2076,7 +2076,7 @@ static void test_plain_merge_update_key_growth_split(void)
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "plain merge updatekey: begin");
     CHECK(mdb_dbi_open(txn, "plain", MDB_CREATE | AGG_SCHEMA, &dbi), "plain merge updatekey: open");
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
     const unsigned NA = 700, NB = 700, NC = 700;
 #else
     const unsigned NA = 2200, NB = 2200, NC = 2200;
@@ -2163,7 +2163,7 @@ static void test_dupsort_main_merge_update_key_growth_split(void)
     CHECK(mdb_txn_begin(env, NULL, 0, &txn), "dups merge updatekey: begin");
     CHECK(mdb_dbi_open(txn, "dups", MDB_CREATE | MDB_DUPSORT | AGG_SCHEMA, &dbi), "dups merge updatekey: open");
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
     const unsigned NA = 500, NB = 500, NC = 500;
 #else
     const unsigned NA = 1600, NB = 1600, NC = 1600;
@@ -2424,7 +2424,7 @@ static void test_dupsort_round_robin(void)
 
 /* ------------------------------ deep DUPSORT dup-subDB (F_SUBDATA) coverage ------------------------------ */
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 #define SUBDB_KEYS 300u
 #define SUBDB_DUPS 600u
 #else
@@ -3215,7 +3215,7 @@ static void test_dupfixed_merge_and_collapse(void)
     MDB_cursor *cur = NULL;
     CHECK(mdb_cursor_open(txn, dbi, &cur), "df merge/collapse: cursor_open");
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
     const unsigned KEYS = 50;
     const unsigned DUPS = 96;
     const unsigned REGROW = 48;
@@ -4794,7 +4794,7 @@ static void shrink_dups_to_keep_last(MDB_txn *txn, MDB_dbi dbi, const MDB_val *k
 
 /* ------------------------------ DUPSORT oscillation (subpage <-> subDB <-> collapse) ------------------------------ */
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 #define OSC_BASE_KEYS 80u
 #define OSC_DUPS 250u
 #else
@@ -4887,7 +4887,7 @@ static void test_dupsort_subpage_subdb_oscillation(void)
             CHECK(mdb_put(txn, dbi, &hotk, &d, 0), "osc: put dup");
 
             if (j >= crit_start) {
-                /* Critical window: check every iteration under MDB_DEBUG_COUNTER builds. */
+                /* Critical window: check every iteration under MDB_DEBUG_AGG_INTEGRITY builds. */
                 DBG_CHECK(txn, dbi, "osc: dbg check (grow)");
                 if ((j % 17u) == 0u)
                     check_key_local_range(txn, dbi, &hotk, hi_sentinel, "osc: range local (grow)");
@@ -5024,7 +5024,7 @@ static void test_dupsort_subpage_subdb_root_split_repair_regress(void)
     mdb_env_close(env);
 }
 
-// #ifdef MDB_DEBUG_COUNTER
+// #ifdef MDB_DEBUG_AGG_INTEGRITY
 // #define HAMMER_ROUNDS 18u
 // #define HAMMER_HOT_KEYS 6u
 // #define HAMMER_HI 260u

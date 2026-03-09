@@ -277,8 +277,6 @@ typedef unsigned int	MDB_dbi;
 /** @brief Opaque structure for navigating through a database */
 typedef struct MDB_cursor MDB_cursor;
 
-// static int mdb_cursor_touch(MDB_cursor *mc);
-
 /** @brief Generic structure used for passing keys and data in and out
  * of the database.
  *
@@ -342,7 +340,8 @@ typedef void (MDB_rel_func)(MDB_val *item, void *oldptr, void *newptr, void *rel
 	/** use the previous snapshot rather than the latest one */
 #define MDB_PREVSNAPSHOT	0x2000000
 
-/* Enable expensive aggregate integrity checks after write operations (debug builds). */
+/* Enable expensive aggregate integrity checks after write operations.
+ * Only has effect when the library is compiled with MDB_DEBUG_AGG_INTEGRITY. */
 #define MDB_AGG_CHECK	0x4000000
 /** @} */
 
@@ -2265,7 +2264,7 @@ mdb_hashsum_extract(const MDB_val *data, size_t off, uint8_t out[MDB_HASH_SIZE])
 
 /** @} */
 
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 int mdb_dbg_check_agg_db(MDB_txn *txn, MDB_dbi dbi);
 #endif
 

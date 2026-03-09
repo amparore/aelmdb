@@ -242,7 +242,7 @@ typedef int mdb_filehandle_t;
 #define MDB_VERSION_DATE	"December 19, 2015"
 
 /** A stringifier for the version info */
-#define MDB_VERSTR(a,b,c,d)	"AELMDB " #a "." #b "." #c ": (" d ")"
+#define MDB_VERSTR(a,b,c,d)	"LMDB " #a "." #b "." #c ": (" d ")"
 
 /** A helper for the stringifier macro */
 #define MDB_VERFOO(a,b,c,d)	MDB_VERSTR(a,b,c,d)
@@ -353,30 +353,8 @@ typedef void (MDB_rel_func)(MDB_val *item, void *oldptr, void *newptr, void *rel
 #define MDB_INTEGERDUP	0x20
 	/** with #MDB_DUPSORT, use reverse string dups */
 #define MDB_REVERSEDUP	0x40
-	/**
-	 * Enable counted branch nodes for fast range counts and order-statistics.
-	 *
-	 * Semantics:
-	 *  - The maintained counters are counts of *records* (key/value pairs).
-	 *  - For #MDB_DUPSORT databases, each duplicate value counts as one record.
-	 *
-	 * Compatibility:
-	 *  - #MDB_COUNTED changes the on-disk branch node layout. It must be enabled
-	 *    when a database is created. Enabling it on an existing database with
-	 *    branch pages requires rebuilding by copying into a new counted database.
-	 */
-#define MDB_COUNTED	0x80
 	/** create DB if not already existing */
 #define MDB_CREATE		0x40000
-/** @} */
-
-/**	@defgroup mdb_counted_range	Counted Range Flags
- *	@{
- */
-/** Include the lower bound key in a key-range count. */
-#define MDB_RANGE_LOWER_INCL	0x02
-/** Include the upper bound key in a key-range count. */
-#define MDB_RANGE_UPPER_INCL	0x04
 /** @} */
 
 /**	@defgroup mdb_put	Write Flags
@@ -997,17 +975,6 @@ typedef void MDB_assert_func(MDB_env *env, const char *msg);
 	 * @return A non-zero error value on failure and 0 on success.
 	 */
 int  mdb_env_set_assert(MDB_env *env, MDB_assert_func *func);
-
-	/** @brief Set or clear an interrupt flag on the environment.
-	 *
-	 * When set, operations return EINTR and mark the active transaction
-	 * as failed. This function only updates a flag and is safe to call
-	 * from a signal handler.
-	 * @param[in] env An environment handle returned by #mdb_env_create()
-	 * @param[in] onoff Non-zero to set the interrupt flag, zero to clear it.
-	 * @return A non-zero error value on failure and 0 on success.
-	 */
-int  mdb_env_set_interrupt(MDB_env *env, int onoff);
 
 	/** @brief Create a transaction for use with the environment.
 	 *
@@ -1671,85 +1638,6 @@ int	mdb_reader_list(MDB_env *env, MDB_msg_func *func, void *ctx);
 	 */
 int	mdb_reader_check(MDB_env *env, int *dead);
 /**	@} */
-
-/**
- * @defgroup mdb_counted Counted database operations
- *
- * These functions require the DBI to have been created with #MDB_COUNTED.
- * They return #MDB_INCOMPATIBLE when called on non-counted databases.
- *
- * A "record" is a (key,value) pair. For #MDB_DUPSORT databases, each duplicate
- * value counts as one record (duplicates are included in counts and ranks).
- *
- * Record ordering is by key (ascending, using the DB's key comparator), and for
- * #MDB_DUPSORT databases, by data (ascending, using the DB's data comparator)
- * within each key. All ranks are zero-based.
- *
- * @{
- */
-
-/** @brief Return the total number of records in a counted database.
- *
- * A record is a (key,value) pair; duplicates are included for #MDB_DUPSORT.
- */
-int mdb_counted_entries(MDB_txn *txn, MDB_dbi dbi, uint64_t *out);
-
-/** @brief Count records whose keys lie within a key range.
- *
- * The range is evaluated over keys only. For #MDB_DUPSORT databases, duplicates
- * are included: if an endpoint key matches, all of that key's duplicates are
- * included or excluded according to the inclusive flag.
- *
- * @param[in] low   Lower-bound key, or NULL for an open-ended range.
- * @param[in] high  Upper-bound key, or NULL for an open-ended range.
- * @param[in] flags Bitwise OR of #MDB_RANGE_LOWER_INCL and/or #MDB_RANGE_UPPER_INCL.
- */
-int mdb_counted_key_range(MDB_txn *txn, MDB_dbi dbi,
-	const MDB_val *low, const MDB_val *high, unsigned flags, uint64_t *out);
-
-/** @brief Fetch the record at the specified zero-based rank.
- *
- * The rank is in record order (key order, then data order for #MDB_DUPSORT).
- */
-int mdb_counted_select(MDB_txn *txn, MDB_dbi dbi, uint64_t rank,
-	MDB_val *key, MDB_val *data);
-
-/** @brief Rank query mode for #mdb_counted_rank().
- *
- * - #MDB_RANK_EXACT: require an exact match for (key,data).
- * - #MDB_RANK_SET_RANGE: return the first record >= (key,data).
- */
-#define MDB_RANK_EXACT		0u
-#define MDB_RANK_SET_RANGE	1u
-
-/** @brief Determine the rank of a record, optionally using set-range semantics.
- *
- * The returned rank is zero-based and is expressed in records (key/value pairs;
- * duplicates are included for #MDB_DUPSORT).
- *
- * - #MDB_RANK_EXACT: require an exact match for the requested record.
- * - #MDB_RANK_SET_RANGE: locate the first record >= the requested record in
- *   record ordering.
- *
- * For non-#MDB_DUPSORT databases, @p data must be empty (size 0 and NULL) and is
- * ignored for the search.
- *
- * For #MDB_DUPSORT databases, record ordering is (key,data). When duplicates are
- * not unique (e.g. if inserted without #MDB_NODUPDATA), #MDB_RANK_EXACT returns
- * the rank of the first duplicate equal to @p data (a lower-bound rank).
- *
- * When #MDB_RANK_SET_RANGE is used, @p key and @p data are treated as input search
- * keys and are updated to the located record on success.
- */
-
-int mdb_counted_rank(MDB_txn *txn, MDB_dbi dbi,
-	MDB_val *key, MDB_val *data, unsigned flags, uint64_t *rank);
-
-#ifdef MDB_DEBUG_COUNTER
-int mdb_dbg_check_counted_db(MDB_txn *txn, MDB_dbi dbi);
-#endif
-
-/** @} */
 
 #ifdef __cplusplus
 }

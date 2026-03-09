@@ -9472,10 +9472,21 @@ mdb_cursor_touch(MDB_cursor *mc)
  * The helpers below are *outer-cursor only* (they skip C_SUB), to avoid noise
  * from nested puts into dup-subpages/subDBs.
  * ------------------------------------------------------------------------- */
-#ifdef MDB_DEBUG_AGG_PRINT
-static uint64_t mdb_dbg_count_tree(MDB_cursor *mc, pgno_t root, int *rc, unsigned *mismatches);
-static uint64_t mdb_dbg_count_page(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatches);
+#ifdef MDB_DEBUG_AGG_ANY
+/* Forward: internal page fetch in LMDB core */
+static int mdb_page_get(MDB_cursor *mc, pgno_t pgno, MDB_page **mp, int *lvl);
 
+typedef struct MDB_dbg_ek {
+	uint64_t entries;
+	uint64_t keys;
+	uint8_t  hashsum[MDB_HASH_SIZE];
+} MDB_dbg_ek;
+
+static MDB_dbg_ek mdb_dbg_count_page_ek(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatches);
+static MDB_dbg_ek mdb_dbg_count_tree_ek(MDB_cursor *mc, pgno_t root, int *rc, unsigned *mismatches);
+#endif
+
+#ifdef MDB_DEBUG_AGG_PRINT
 /* Snapshot key count-related state around the put_sub path.
  *
  * This is intentionally slow and verbose. It prints:
@@ -9511,7 +9522,7 @@ mdb_dbg_putsub_snapshot(MDB_cursor *mc, const char *tag,
 	if (ppg && pnode && IS_BRANCH(ppg) && IS_COUNTED(ppg))
 		stored_parent = mdb_node_get_count(ppg, pnode);
 
-	computed_leaf = mdb_dbg_count_page(mc, lpg, &trc, &mism);
+	computed_leaf = mdb_dbg_count_page_ek(mc, lpg, &trc, &mism).entries;
 
 	fprintf(stderr,
 		"[PUT_SUB %s] rc=%d split=%d insert_key=%d insert_data=%" PRIu64
@@ -9557,7 +9568,7 @@ mdb_dbg_putsub_snapshot(MDB_cursor *mc, const char *tag,
 			pgno_t cpg = NODEPGNO(pn);
 			uint64_t stored = mdb_node_get_count(ppg, pn);
 			int rc2 = 0; unsigned mm2 = 0;
-			uint64_t comp = mdb_dbg_count_tree(mc, cpg, &rc2, &mm2);
+			uint64_t comp = mdb_dbg_count_tree_ek(mc, cpg, &rc2, &mm2).entries;
 			if (stored != comp) {
 				fprintf(stderr,
 					"  [PARENT MISMATCH %s] parent=%" PRIu64
@@ -9599,7 +9610,7 @@ mdb_dbg_cntdbg_pre(MDB_cursor *mc, const char *tag,
 	}
 
 	int trc = 0; unsigned mm = 0;
-	uint64_t subtree_dbg = mdb_dbg_count_page(mc, leafp, &trc, &mm);
+	uint64_t subtree_dbg = mdb_dbg_count_page_ek(mc, leafp, &trc, &mm).entries;
 	uint64_t mx_entries = mc->mc_xcursor ? (uint64_t)mc->mc_xcursor->mx_db.md_entries : 0;
 
 	fprintf(stderr,
@@ -9627,7 +9638,7 @@ mdb_dbg_cntdbg_pre(MDB_cursor *mc, const char *tag,
 				tmp.mc_txn = mc->mc_txn;
 				tmp.mc_db = &db;
 				tmp.mc_dbi = mc->mc_dbi;
-				uint64_t truec = mdb_dbg_count_tree(&tmp, db.md_root, &rc2, &mm2);
+				uint64_t truec = mdb_dbg_count_tree_ek(&tmp, db.md_root, &rc2, &mm2).entries;
 				fprintf(stderr, " SUBDB md_entries=%"PRIu64" true=%"PRIu64" rc=%d",
 					(uint64_t)db.md_entries, truec, rc2);
 			} else {
@@ -9688,7 +9699,7 @@ mdb_dbg_put_dump_parent(MDB_cursor *mc, MDB_page *pp, const char *tag)
 		pgno_t child = NODEPGNO(pn);
 		uint64_t stored = mdb_node_get_count(pp, pn);
 		int rc2 = 0; unsigned mm2 = 0;
-		uint64_t comp = mdb_dbg_count_tree(mc, child, &rc2, &mm2);
+		uint64_t comp = mdb_dbg_count_tree_ek(mc, child, &rc2, &mm2).entries;
 		fprintf(stderr,
 			"  idx=%u child=%"Yu" stored=%"PRIu64" comp=%"PRIu64" rc=%d mm=%u\n",
 			(unsigned)i, child, stored, comp, rc2, mm2);
@@ -9740,7 +9751,7 @@ mdb_dbg_put_dump_stack(MDB_cursor *mc, const char *tag,
 				if (pn) {
 					uint64_t stored = mdb_node_get_count(p, pn);
 					int rc2 = 0; unsigned mm2 = 0;
-					uint64_t comp = mdb_dbg_count_tree(mc, child, &rc2, &mm2);
+					uint64_t comp = mdb_dbg_count_tree_ek(mc, child, &rc2, &mm2).entries;
 					fprintf(stderr,
 						"    link: parent=%"Yu" child=%"Yu" idx=%u stored=%"PRIu64" comp=%"PRIu64" rc=%d mm=%u\n",
 						p->mp_pgno, child, (unsigned)found, stored, comp, rc2, mm2);
@@ -9784,7 +9795,7 @@ mdb_dbg_put_check_stack(MDB_cursor *mc, const char *tag)
 		MDB_node *pn = NODEPTR(pp, found);
 		uint64_t stored = mdb_node_get_count(pp, pn);
 		int rc2 = 0; unsigned mm2 = 0;
-		uint64_t comp = mdb_dbg_count_tree(mc, child, &rc2, &mm2);
+		uint64_t comp = mdb_dbg_count_tree_ek(mc, child, &rc2, &mm2).entries;
 
 		if (rc2 || stored != comp) {
 			fprintf(stderr,
@@ -9825,7 +9836,7 @@ mdb_dbg_del_dump_parent(MDB_cursor *mc, MDB_page *pp, const char *tag)
 		pgno_t child = NODEPGNO(pn);
 		uint64_t stored = mdb_node_get_count(pp, pn);
 		int rc2 = 0; unsigned mm2 = 0;
-		uint64_t comp = mdb_dbg_count_tree(mc, child, &rc2, &mm2);
+		uint64_t comp = mdb_dbg_count_tree_ek(mc, child, &rc2, &mm2).entries;
 		fprintf(stderr,
 			"  idx=%u child=%"Yu" stored=%"PRIu64" comp=%"PRIu64" rc=%d mm=%u\n",
 			(unsigned)i, child, stored, comp, rc2, mm2);
@@ -9876,7 +9887,7 @@ mdb_dbg_del_dump_stack(MDB_cursor *mc, const char *tag,
 				if (pn) {
 					uint64_t stored = mdb_node_get_count(p, pn);
 					int rc2 = 0; unsigned mm2 = 0;
-					uint64_t comp = mdb_dbg_count_tree(mc, child, &rc2, &mm2);
+					uint64_t comp = mdb_dbg_count_tree_ek(mc, child, &rc2, &mm2).entries;
 					fprintf(stderr,
 						"    link: parent=%"Yu" child=%"Yu" idx=%u stored=%"PRIu64" comp=%"PRIu64" rc=%d mm=%u\n",
 						p->mp_pgno, child, (unsigned)found, stored, comp, rc2, mm2);
@@ -9917,7 +9928,7 @@ mdb_dbg_del_check_stack(MDB_cursor *mc, const char *tag)
 		MDB_node *pn = NODEPTR(pp, found);
 		uint64_t stored = mdb_node_get_count(pp, pn);
 		int rc2 = 0; unsigned mm2 = 0;
-		uint64_t comp = mdb_dbg_count_tree(mc, child, &rc2, &mm2);
+		uint64_t comp = mdb_dbg_count_tree_ek(mc, child, &rc2, &mm2).entries;
 
 		if (rc2 || stored != comp) {
 			fprintf(stderr,
@@ -17256,19 +17267,6 @@ mdb_agg_window_rank(MDB_txn *txn, MDB_dbi dbi,
 /* Forward: internal page fetch in LMDB core */
 static int mdb_page_get(MDB_cursor *mc, pgno_t pgno, MDB_page **mp, int *lvl);
 
-
-static uint64_t
-mdb_dbg_count_page(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatches);
-
-typedef struct MDB_dbg_ek {
-	uint64_t entries;
-	uint64_t keys;
-	uint8_t  hashsum[MDB_HASH_SIZE];
-} MDB_dbg_ek;
-
-static MDB_dbg_ek
-mdb_dbg_count_page_ek(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatches);
-
 #ifdef MDB_DEBUG_AGG_PRINT
 static void mdb_dbg_fprint_hex(FILE *fp, const uint8_t *p, size_t n);
 #endif
@@ -17294,14 +17292,6 @@ mdb_dbg_count_tree_ek(MDB_cursor *mc, pgno_t root, int *rc, unsigned *mismatches
 		return (MDB_dbg_ek){0,0,{0}};
 
 	return mdb_dbg_count_page_ek(mc, mp, rc, mismatches);
-}
-
-/* Backward-compatible wrapper: entries-only total. */
-static uint64_t
-mdb_dbg_count_tree(MDB_cursor *mc, pgno_t root, int *rc, unsigned *mismatches)
-{
-	MDB_dbg_ek ek = mdb_dbg_count_tree_ek(mc, root, rc, mismatches);
-	return ek.entries;
 }
 
 /* Count "records" for a leaf entry in a DUPSORT leaf: either 1, or the number of dup values. */
@@ -17512,14 +17502,6 @@ mdb_dbg_count_page_ek(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatche
 		}
 		return total;
 	}
-}
-
-/* Backward-compatible wrapper: entries-only count for a page subtree (also validates aggregates). */
-static uint64_t
-mdb_dbg_count_page(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatches)
-{
-	MDB_dbg_ek ek = mdb_dbg_count_page_ek(mc, mp, rc, mismatches);
-	return ek.entries;
 }
 
 #ifdef MDB_DEBUG_AGG_INTEGRITY

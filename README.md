@@ -549,7 +549,7 @@ Practical implications:
 
 * **Enable aggregate flags at DBI creation time.** The DBI’s aggregate schema (`MDB_AGG_*`) is stored/validated against page headers; mismatches are treated as corruption.
 * **Changing the aggregate schema after data exists generally requires rebuilding.** If a DBI already has branch pages, switching aggregate flags typically means copying all data into a fresh DBI created with the desired flags. 
-* **Important! The AELMDB data format is different and binary incompatible with that of both LMDB and DLMDB.**
+* ⚠️**Important! The AELMDB data format is different and binary incompatible with that of both LMDB and DLMDB.**
 
 
 

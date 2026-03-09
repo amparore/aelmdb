@@ -423,6 +423,8 @@ They cache the expensive part, mapping a key-range window to an **absolute entry
 
 This is the exact pattern used by Negentropy-style reconciliation loops: many fingerprint calls + many lower-bound calls, all within stable outer bounds. (see [negentropy](https://github.com/hoytech/negentropy))
 
+See also the AELMDB storage in Negentropy for Range-Based Set Reconciliation, named [AELMDBSlice](https://github.com/amparore/negentropy-aelmdb), and the extended C++ wrapper [lmdbxx](https://github.com/amparore/lmdbxx-aelmdb).
+
 
 
 ## Cached window descriptor

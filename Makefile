@@ -1,4 +1,4 @@
-# Makefile for liblmdb (Lightning memory-mapped database library)
+# Makefile for AELMDB (Anti-Entropy Lightning memory-mapped database library)
 
 ########################################################################
 # Toolchain / flags (override on command line if needed)

@@ -519,17 +519,19 @@ mdb_env_set_flags(env, MDB_AGG_CHECK, 1);   /* enable expensive post-write agg c
 mdb_env_set_flags(env, MDB_AGG_CHECK, 0);   /* disable */
 ```
 
-### `MDB_DEBUG_COUNTER` (preprocessor macro) and `mdb_dbg_check_agg_db()`
+### `MDB_DEBUG_AGG_INTEGRITY` (preprocessor macro) and `mdb_dbg_check_agg_db()`
 
-When AELMDB is compiled with `MDB_DEBUG_COUNTER`, it exposes a dedicated API to **explicitly verify aggregate consistency** for a DBI by performing a linear scan of the entire database and checking that aggregates are consistent:
+When AELMDB is compiled with `MDB_DEBUG_AGG_INTEGRITY`, it exposes a dedicated API to **explicitly verify aggregate consistency** for a DBI by performing a linear scan of the entire database and checking that aggregates are consistent:
 
 ```c
-#ifdef MDB_DEBUG_COUNTER
+#ifdef MDB_DEBUG_AGG_INTEGRITY
 int mdb_dbg_check_agg_db(MDB_txn *txn, MDB_dbi dbi);
 #endif
 ```
 
-This is intended for unit tests that want to run a full “check aggregates now” pass on demand.
+This is intended for unit tests that want to run a full “check aggregates now” pass on demand. 
+This macro also activates sevral (slow) integrity checks.
+A second macro `MDB_DEBUG_AGG_PRINT` adds important debug prints of the internal steps, again for debug purposes.
 
 
 

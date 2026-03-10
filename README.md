@@ -21,7 +21,7 @@ AELMDB keeps that model, but adds an optional *interpretation layer* for **anti-
 * but *if you opt in* (via DBI flags), AELMDB assumes that **within each record there exists a fixed-size “hash slice”**:
 
   * either inside the **value bytes** (default), or inside the **key bytes** (when `MDB_AGG_HASHSOURCE_FROM_KEY` is enabled)
-  * at a configurable **byte offset** (`hash_offset`)
+  * at a configurable **signed byte offset** (hash_offset): >=0 from start, <0 from end (-1 = last bytes)
   * with a fixed width of `MDB_HASH_SIZE` bytes
 
 When enabled, AELMDB maintains a **hashsum aggregate** by summing (with wraparound arithmetic) that `MDB_HASH_SIZE`-byte slice for every record in a subtree. This makes it possible to compute **range fingerprints** efficiently (a building block for anti-entropy / reconciliation), without scanning all records in the range.
@@ -48,13 +48,12 @@ For every entry, AELMDB extracts exactly **`MDB_HASH_SIZE` bytes**:
 * **From where (hash source):**
   * by default, from the entry’s **value** bytes
   * if `MDB_AGG_HASHSOURCE_FROM_KEY` is set, from the entry’s **key** bytes instead
-* **From which position:** starting at the DBI’s configured **`hash_offset`** (set once via `mdb_set_hash_offset()` on an empty DBI)
+* **From which position:** the DBI’s configured **`hash_offset`** (set once via `mdb_set_hash_offset()` on an empty DBI) selects the **start** of the `MDB_HASH_SIZE` slice:
 
-So the extracted slice is always:
+  * `hash_offset >= 0`: start at `hash_offset` bytes from the beginning
+  * `hash_offset < 0`: start from the end, where `-1` means “use the last `MDB_HASH_SIZE` bytes” (and `-k` means `(k-1)` bytes earlier)
 
-* `value[hash_offset .. hash_offset + MDB_HASH_SIZE)` (vaue-hash mode, default), or
-* `key[hash_offset .. hash_offset + MDB_HASH_SIZE)` (key-hash mode)
-
+The extracted slice is `source[start .. start + MDB_HASH_SIZE)` where `source` is `value` (default) or `key` (when `MDB_AGG_HASHSOURCE_FROM_KEY` is set).
 `MDB_HASH_SIZE` defaults to **32 bytes** and is currently required to be a **multiple of 8**.
 
 
@@ -93,7 +92,7 @@ When you open (or create) a DBI, you choose an **aggregate schema** by OR-ing `M
 If you enable `MDB_AGG_HASHSUM`, you must also configure **where the hash slice lives** inside the chosen hash source (value by default, or key in key-hash mode) using `mdb_set_hash_offset()`. This configuration is per-DBI, must be done in a **write transaction**, and only while the DBI is **still empty**.
 
 **Example: plain aggregate DBI (hash slice taken from value bytes)**
-This DBI maintains entry counts, distinct-key counts, and a hashsum fingerprint. The hash slice is `value[hash_offset .. hash_offset + MDB_HASH_SIZE)`.
+This DBI maintains entry counts, distinct-key counts, and a hashsum fingerprint from the defined hash slice.
 
 ```c
 unsigned flags =
@@ -105,8 +104,8 @@ unsigned flags =
 MDB_dbi dbi;
 mdb_dbi_open(txn, "plain_agg", flags, &dbi);
 
-/* Take MDB_HASH_SIZE bytes starting at offset 0 from each VALUE */
-mdb_set_hash_offset(txn, dbi, 0);
+`/* hash_offset: 0 = first bytes, -1 = last bytes */`
+mdb_set_hash_offset(txn, dbi, /*hash_offset = */0);
 ```
 
 **Example: `MDB_DUPSORT` aggregate DBI (multiple values per key)**
@@ -121,12 +120,13 @@ unsigned flags =
 MDB_dbi dbi;
 mdb_dbi_open(txn, "dups_agg", flags, &dbi);
 
-/* Still value-based hashsum: slice is taken from VALUE bytes */
+/* DUPSORT: still value-based hashsum; hash_offset uses the same signed semantics */
 mdb_set_hash_offset(txn, dbi, 0);
 ```
 
 **Example: key-based hashsum (hash slice taken from key bytes)**
-This mode is useful when your key embeds a stable fixed-size identifier (e.g., `[timestamp | 32-byte-id]`) and you want fingerprints derived from keys rather than values. In this configuration the hash slice is `key[hash_offset .. hash_offset + MDB_HASH_SIZE)`.
+This mode is useful when your key embeds a stable fixed-size identifier (e.g., `[timestamp | 32-byte-id]`) and you want fingerprints derived from keys rather than values. 
+In this configuration the hash slice is `key[hash_offset .. hash_offset + MDB_HASH_SIZE)`.
 
 ```c
 unsigned flags =
@@ -137,8 +137,9 @@ unsigned flags =
 MDB_dbi dbi;
 mdb_dbi_open(txn, "key_hash_agg", flags, &dbi);
 
-/* If your key is [prefix | 32-byte-hash | suffix], set hash_offset to the prefix length
-   so the MDB_HASH_SIZE slice lands on the embedded hash. */
+/* If key has structure [prefix | 32-byte-hash | suffix] use
+ *  - if prefix has fixed length PREFIX_LEN then use hash_offset = PREFIX_LEN
+ *  - if suffix has fixed length SUFFIX_LEN then use hash_offset = -1 - SUFFIX_LEN */
 mdb_set_hash_offset(txn, dbi, /*hash_offset=*/PREFIX_LEN);
 ```
 
@@ -170,7 +171,8 @@ static inline void mdb_hashsum_diff(uint8_t *out, const uint8_t *a, const uint8_
 static inline int  mdb_hashsum_is_zero(const uint8_t *p);
 ```
 
-Since the hashsum is defined as “sum of the `MDB_HASH_SIZE`-byte slice starting at `hash_offset`”, there are also helpers (`mdb_hashsum_extract_bytes`, `mdb_hashsum_extract`) to extract that slice in a consistent, bounds-checked way.
+Since the hashsum is defined as “sum of the MDB_HASH_SIZE-byte slice selected by hash_offset”, the header provides bounds-checked slice helpers:
+`mdb_hashsum_slice_ptr_bytes`/`mdb_hashsum_slice_ptr`(pointer) and `mdb_hashsum_extract_bytes`/`mdb_hashsum_extract` (copy).
 
 
 
@@ -217,17 +219,6 @@ int mdb_agg_info(
 ```
 
 Use this when you want to **detect at runtime** which aggregate components are available (e.g., to decide whether you can run rank/select or hashsum-based fingerprints).
-
-<!-- ```c
-/* Configure per-DB hashsum offset (HASHSUM DBIs only) */
-int mdb_set_hash_offset(
-  MDB_txn   *txn,         // write transaction (required)
-  MDB_dbi    dbi,         // HASHSUM-enabled DBI (must be empty)
-  unsigned   hash_offset  // number of bytes into the hash source where the MDB_HASH_SIZE window begins
-);
-```
-
-This defines which raw bytes are included in the hashsum (value bytes by default; key bytes when `MDB_AGG_HASHSOURCE_FROM_KEY` is set). Can be called only with an empty DBI. Hash offset can be recovered using `mdb_get_hash_offset`. -->
 
 ### `mdb_agg_totals()`
 

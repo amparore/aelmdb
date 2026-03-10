@@ -684,7 +684,7 @@ static txnid_t mdb_debug_start;
 	/* Aggregate fork file format tag.
 	* Upper 16 bits identify this fork format, lower 16 bits bind MDB_HASH_SIZE.
 	*/
-#define MDB_DATA_VERSION_TAG   0xA332u
+#define MDB_DATA_VERSION_TAG   0xA333u
 #define MDB_DATA_VERSION \
 	((MDB_DATA_VERSION_TAG << 16) | ((unsigned)(MDB_HASH_SIZE) & 0xFFFFu))
 
@@ -1148,7 +1148,7 @@ mdb_page_pgno_set(MDB_page *mp, pgno_t pgno)
 #define MDB_AGG_SCHEMA_MASK	MDB_AGG_INFO_MASK
 #define DB_AGGSCHEMAFLAGS(db)	 ((uint16_t)((db)->md_flags & MDB_AGG_SCHEMA_MASK))
 #define HAS_AGG(db)		 (DB_AGGFLAGS(db) != 0)
-#define MDB_HASH_NEED(db)	((size_t)(db)->md_hash_offset + (size_t)MDB_HASH_SIZE)
+
 
 	/** Test if a page is an overflow page */
 #define IS_OVERFLOW(p)	 F_ISSET(MP_FLAGS(p), P_OVERFLOW)
@@ -1555,7 +1555,7 @@ typedef struct MDB_db {
 	pgno_t		md_overflow_pages;	/**< number of overflow pages */
 	mdb_size_t	md_entries;		/**< number of logical entries (including dup multiplicities) */
 	mdb_size_t	md_keys;		/**< number of distinct keys (maintained when MDB_AGG_KEYS) */
-	uint16_t	md_hash_offset;	/**< offset of hash bytes within hash source (value by default; key when MDB_AGG_HASHSOURCE_FROM_KEY) */
+	int16_t		md_hash_offset;	/**< hash slice offset within the logical hash source; interpreted only via mdb_hashslice_* helpers */
 	uint8_t		md_hashsum[MDB_HASH_SIZE];	/**< sum of value-hashes (maintained when MDB_AGG_HASHSUM) */
 	pgno_t		md_root;		/**< the root page of this tree */
 } MDB_db;
@@ -2614,10 +2614,11 @@ mdb_page_subtree_agg(MDB_cursor *mc, MDB_page *mp, MDB_aggval *out,
 		key_total = NUMKEYS(mp);
 
 		if (hs_acc) {
-			if ((size_t)ksize < MDB_HASH_NEED(mc->mc_db))
+			size_t hstart;
+			if (mdb_hashslice_start((size_t)ksize, mc->mc_db->md_hash_offset, &hstart))
 				return mdb_agg_corrupt(mc, "subtree_agg_hash_leaf2_key_too_small", mp, NULL, mp->mp_pgno);
 			for (i = 0; i < NUMKEYS(mp); i++)
-				mdb_hashsum_add(hs_acc, (const uint8_t *)LEAF2KEY(mp, i, ksize) + mc->mc_db->md_hash_offset);
+				mdb_hashsum_add(hs_acc, (const uint8_t *)LEAF2KEY(mp, i, ksize) + hstart);
 		}
 
 		mdb_agg_entries_set(have, out, ent_total);
@@ -2646,17 +2647,21 @@ mdb_page_subtree_agg(MDB_cursor *mc, MDB_page *mp, MDB_aggval *out,
 						}
 						vv.mv_size = NODEKSZ(node);
 						vv.mv_data = NODEKEY(mp, node);
-						if (vv.mv_size < MDB_HASH_NEED(mc->mc_db))
-							return mdb_agg_corrupt(mc, "subtree_agg_hash_key_too_small", mp, NULL, mp->mp_pgno);
 					} else {
 						rc = mdb_node_read(mc, node, &vv);
 						if (rc)
 							return rc;
-						if (vv.mv_size < MDB_HASH_NEED(mc->mc_db))
-							return mdb_agg_corrupt(mc, "subtree_agg_hash_value_too_small", mp, NULL, mp->mp_pgno);
 					}
-
-					mdb_hashsum_add(hs_acc, (const uint8_t *)vv.mv_data + mc->mc_db->md_hash_offset);
+					{
+						const uint8_t *hs;
+						int trc = mdb_hashslice_ptr_bytes(vv.mv_data, vv.mv_size, mc->mc_db->md_hash_offset, &hs);
+						if (trc) {
+							return mdb_agg_corrupt(mc,
+								mdb_hashsum_source_is_key(mc) ? "subtree_agg_hash_key_too_small" : "subtree_agg_hash_value_too_small",
+								mp, NULL, mp->mp_pgno);
+						}
+						mdb_hashsum_add(hs_acc, hs);
+					}
 					continue;
 				}
 
@@ -2687,20 +2692,22 @@ mdb_page_subtree_agg(MDB_cursor *mc, MDB_page *mp, MDB_aggval *out,
 
 					if (IS_LEAF2(sp)) {
 						unsigned ksize = sp->mp_pad;
-						if ((size_t)ksize < MDB_HASH_NEED(mc->mc_db))
+						size_t hstart;
+						if (mdb_hashslice_start((size_t)ksize, mc->mc_db->md_hash_offset, &hstart))
 							return mdb_agg_corrupt(mc, "subtree_agg_hash_subleaf2_key_too_small", mp, sp, mp->mp_pgno);
 						for (j = 0; j < NUMKEYS(sp); j++)
-							mdb_hashsum_add(hs_acc, (const uint8_t *)LEAF2KEY(sp, j, ksize) + mc->mc_db->md_hash_offset);
+							mdb_hashsum_add(hs_acc, (const uint8_t *)LEAF2KEY(sp, j, ksize) + hstart);
 					} else {
 						for (j = 0; j < NUMKEYS(sp); j++) {
 							MDB_node *ln = NODEPTR(sp, j);
 							MDB_val vv;
+							const uint8_t *hs;
 
 							vv.mv_size = NODEKSZ(ln);
 							vv.mv_data = NODEKEY(sp, ln);
-							if (vv.mv_size < MDB_HASH_NEED(mc->mc_db))
+							if (mdb_hashslice_ptr_bytes(vv.mv_data, vv.mv_size, mc->mc_db->md_hash_offset, &hs))
 								return mdb_agg_corrupt(mc, "subtree_agg_hash_subleaf_key_too_small", mp, sp, mp->mp_pgno);
-							mdb_hashsum_add(hs_acc, (const uint8_t *)vv.mv_data + mc->mc_db->md_hash_offset);
+							mdb_hashsum_add(hs_acc, hs);
 						}
 					}
 				}
@@ -10159,17 +10166,21 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 		rc = mdb_hashsum_write_policy_check(mc->mc_txn, mc->mc_db, flags);
 		if (rc)
 			return rc;
-		/* Enforce minimum value/key size for hash extraction. */
+		/* Enforce hash slice validity for the initial source (key or value). */
 		{
 			const MDB_val *hsrc = hs_from_key ? key : data;
-			if (!hsrc || hsrc->mv_size < MDB_HASH_NEED(mc->mc_db))
+			size_t hstart;
+			if (!hsrc || mdb_hashslice_start(hsrc->mv_size, mc->mc_db->md_hash_offset, &hstart))
 				return MDB_BAD_VALSIZE;
 		}
 		/* DUPFIXED stores logical values as keys; key size must be >= MDB_HASH_SIZE.
 		 * For a newly created DUPFIXED DB, md_pad is not set until the first insert.
 		 */
-		if ((mc->mc_db->md_flags & MDB_DUPFIXED) && mc->mc_db->md_pad && ((size_t)mc->mc_db->md_pad < MDB_HASH_NEED(mc->mc_db)))
-			return MDB_BAD_VALSIZE;
+		if ((mc->mc_db->md_flags & MDB_DUPFIXED) && mc->mc_db->md_pad) {
+			size_t hstart;
+			if (mdb_hashslice_start((size_t)mc->mc_db->md_pad, mc->mc_db->md_hash_offset, &hstart))
+				return MDB_BAD_VALSIZE;
+		}
 	}
 
 	/* Check this first so counter will always be zero on any
@@ -10313,8 +10324,11 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 				uint8_t oldhs2[MDB_HASH_SIZE], newhs2[MDB_HASH_SIZE], diff2[MDB_HASH_SIZE];
 				MDB_aggval delta;
 				int trc;
-				if ((size_t)ksize < MDB_HASH_NEED(mc->mc_db))
-					return MDB_BAD_VALSIZE;
+				{
+					size_t hstart;
+					if (mdb_hashslice_start((size_t)ksize, mc->mc_db->md_hash_offset, &hstart))
+						return MDB_BAD_VALSIZE;
+				}
 				trc = mdb_hashsum_extract_bytes(ptr, ksize, mc->mc_db->md_hash_offset, oldhs2);
 				if (trc)
 					return trc;
@@ -10384,12 +10398,13 @@ more:
 
 		if (hs_enabled && !hs_from_key && !F_ISSET(leaf->mn_flags, F_DUPDATA)) {
 			MDB_val vv;
+			const uint8_t *hs;
 			rc2 = mdb_node_read(mc, leaf, &vv);
 			if (rc2)
 				return rc2;
-			if (vv.mv_size < MDB_HASH_NEED(mc->mc_db))
-					return MDB_BAD_VALSIZE;
-			memcpy(oldhs, (const uint8_t *)vv.mv_data + mc->mc_db->md_hash_offset, MDB_HASH_SIZE);
+			if (mdb_hashslice_ptr_bytes(vv.mv_data, vv.mv_size, mc->mc_db->md_hash_offset, &hs))
+				return MDB_BAD_VALSIZE;
+			memcpy(oldhs, hs, MDB_HASH_SIZE);
 			have_oldhs = 1;
 		}
 
@@ -10836,17 +10851,16 @@ put_sub:
 				}
 				if (IS_LEAF2(xmp)) {
 					unsigned ksize = xmp->mp_pad;
-					if ((size_t)ksize < MDB_HASH_NEED(mc->mc_db)) {
-						rc = MDB_BAD_VALSIZE;
-						goto bad_sub;
+					{
+						size_t hstart;
+						if (mdb_hashslice_start((size_t)ksize, mc->mc_db->md_hash_offset, &hstart)) {
+							rc = MDB_BAD_VALSIZE;
+							goto bad_sub;
+						}
 					}
 					trc = mdb_hashsum_extract_bytes(LEAF2KEY(xmp, xki, ksize), ksize, mc->mc_db->md_hash_offset, sub_oldhs);
 				} else {
 					MDB_node *xleaf = NODEPTR(xmp, xki);
-					if (NODEKSZ(xleaf) < MDB_HASH_NEED(mc->mc_db)) {
-						rc = MDB_BAD_VALSIZE;
-						goto bad_sub;
-					}
 					trc = mdb_hashsum_extract_bytes(NODEKEY(xmp, xleaf), NODEKSZ(xleaf), mc->mc_db->md_hash_offset, sub_oldhs);
 				}
 				if (trc) {
@@ -10922,11 +10936,24 @@ put_sub:
 
 					if (n > maxn)
 						n = maxn;
-					for (j = 0; j < n; j++, p += sz)
-						mdb_hashsum_add(hsdelta, p + mc->mc_db->md_hash_offset);
+						{
+							size_t hstart;
+							if (mdb_hashslice_start(sz, mc->mc_db->md_hash_offset, &hstart)) {
+								rc = MDB_BAD_VALSIZE;
+								goto bad_sub;
+							}
+							for (j = 0; j < n; j++, p += sz)
+								mdb_hashsum_add(hsdelta, p + hstart);
+						}
 				} else {
 					const MDB_val *vv = hs_from_key ? key : data;
-					memcpy(hsdelta, (const uint8_t *)vv->mv_data + mc->mc_db->md_hash_offset, MDB_HASH_SIZE);
+						const uint8_t *hs;
+						int trc = mdb_hashslice_ptr_bytes(vv->mv_data, vv->mv_size, mc->mc_db->md_hash_offset, &hs);
+						if (trc) {
+							rc = trc;
+							goto bad_sub;
+						}
+						memcpy(hsdelta, hs, MDB_HASH_SIZE);
 				}
 			} else if (!insert_data && (have_sub_tot_before || have_sub_oldhs)) {
 				/* Dup-container update (subpage or dup-subDB):
@@ -11159,8 +11186,11 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
 				indx_t xki = xmc->mc_ki[xmc->mc_top];
 				if (IS_LEAF2(xmp)) {
 					unsigned ksize = xmp->mp_pad;
-					if ((size_t)ksize < MDB_HASH_NEED(mc->mc_db))
-						return MDB_BAD_VALSIZE;
+					{
+						size_t hstart;
+						if (mdb_hashslice_start((size_t)ksize, mc->mc_db->md_hash_offset, &hstart))
+							return MDB_BAD_VALSIZE;
+					}
 					{
 						int trc = mdb_hashsum_extract_bytes(LEAF2KEY(xmp, xki, ksize), ksize, mc->mc_db->md_hash_offset, dup_hs);
 						if (trc)
@@ -11168,8 +11198,11 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
 					}
 				} else {
 					MDB_node *xleaf = NODEPTR(xmp, xki);
-					if (NODEKSZ(xleaf) < MDB_HASH_NEED(mc->mc_db))
-						return MDB_BAD_VALSIZE;
+					{
+						size_t hstart;
+						if (mdb_hashslice_start(NODEKSZ(xleaf), mc->mc_db->md_hash_offset, &hstart))
+							return MDB_BAD_VALSIZE;
+					}
 					{
 						int trc = mdb_hashsum_extract_bytes(NODEKEY(xmp, xleaf), NODEKSZ(xleaf), mc->mc_db->md_hash_offset, dup_hs);
 						if (trc)
@@ -12820,9 +12853,12 @@ mdb_cursor_del0(MDB_cursor *mc)
 			if (!(mc->mc_flags & C_SUB))
 				return MDB_INCOMPATIBLE;
 			unsigned ksize = mp->mp_pad;
-			if ((size_t)ksize < MDB_HASH_NEED(mc->mc_db))
+			{
+				const uint8_t *hs;
+				if (mdb_hashslice_ptr_bytes(LEAF2KEY(mp, ki, ksize), ksize, mc->mc_db->md_hash_offset, &hs))
 					return MDB_BAD_VALSIZE;
-			memcpy(hsbuf, (const uint8_t *)LEAF2KEY(mp, ki, ksize) + mc->mc_db->md_hash_offset, MDB_HASH_SIZE);
+				memcpy(hsbuf, hs, MDB_HASH_SIZE);
+			}
 			have_hs = 1;
 		} else {
 			MDB_node *leaf = NODEPTR(mp, ki);
@@ -12837,16 +12873,18 @@ mdb_cursor_del0(MDB_cursor *mc)
 
 					if (IS_LEAF2(sp)) {
 						unsigned ksize = sp->mp_pad;
-						if ((size_t)ksize < MDB_HASH_NEED(mc->mc_db))
-								return MDB_BAD_VALSIZE;
+						size_t hstart;
+						if (mdb_hashslice_start((size_t)ksize, mc->mc_db->md_hash_offset, &hstart))
+							return MDB_BAD_VALSIZE;
 						for (j = 0; j < NUMKEYS(sp); j++)
-							mdb_hashsum_add(hsbuf, (const uint8_t *)LEAF2KEY(sp, j, ksize) + mc->mc_db->md_hash_offset);
+							mdb_hashsum_add(hsbuf, (const uint8_t *)LEAF2KEY(sp, j, ksize) + hstart);
 					} else {
 						for (j = 0; j < NUMKEYS(sp); j++) {
 							MDB_node *ln = NODEPTR(sp, j);
-							if (NODEKSZ(ln) < MDB_HASH_NEED(mc->mc_db))
-									return MDB_BAD_VALSIZE;
-							mdb_hashsum_add(hsbuf, (const uint8_t *)NODEKEY(sp, ln) + mc->mc_db->md_hash_offset);
+							const uint8_t *hs;
+							if (mdb_hashslice_ptr_bytes(NODEKEY(sp, ln), NODEKSZ(ln), mc->mc_db->md_hash_offset, &hs))
+								return MDB_BAD_VALSIZE;
+							mdb_hashsum_add(hsbuf, hs);
 						}
 					}
 					have_hs = mdb_hashsum_nonzero_buf(hsbuf);
@@ -12863,9 +12901,12 @@ mdb_cursor_del0(MDB_cursor *mc)
 					if (trc)
 						return trc;
 				}
-				if (vv.mv_size < MDB_HASH_NEED(mc->mc_db))
+				{
+					const uint8_t *hs;
+					if (mdb_hashslice_ptr_bytes(vv.mv_data, vv.mv_size, mc->mc_db->md_hash_offset, &hs))
 						return MDB_BAD_VALSIZE;
-				memcpy(hsbuf, (const uint8_t *)vv.mv_data + mc->mc_db->md_hash_offset, MDB_HASH_SIZE);
+					memcpy(hsbuf, hs, MDB_HASH_SIZE);
+				}
 				have_hs = 1;
 			}
 		}
@@ -14492,9 +14533,12 @@ mdb_dbi_check_open_flags(MDB_txn *txn, const MDB_db *db, unsigned int flags, int
 		 * workloads, but we reject any write attempt (mdb_put/mdb_del/mdb_drop) at runtime.
 		 * This avoids blocking read-only access while still preventing aggregate corruption.
 		 */
-		/* DUPFIXED stores logical values as keys; key size must be >= (md_hash_offset + MDB_HASH_SIZE). */
-		if ((db->md_flags & MDB_DUPFIXED) && db->md_pad && (size_t)db->md_pad < MDB_HASH_NEED(db))
-			return MDB_INCOMPATIBLE;
+		/* DUPFIXED stores logical values as keys; the selected hash slice must fit within md_pad. */
+		if ((db->md_flags & MDB_DUPFIXED) && db->md_pad) {
+			size_t hstart;
+			if (mdb_hashslice_start((size_t)db->md_pad, db->md_hash_offset, &hstart))
+				return MDB_INCOMPATIBLE;
+		}
 	}
 
 	return mdb_dbi_check_agg_root(txn, db);
@@ -14942,10 +14986,10 @@ mdb_agg_info(MDB_txn *txn, MDB_dbi dbi, unsigned *agg_flags)
 
 
 int ESECT
-mdb_set_hash_offset(MDB_txn *txn, MDB_dbi dbi, unsigned hash_offset)
+mdb_set_hash_offset(MDB_txn *txn, MDB_dbi dbi, int hash_offset)
 {
 	MDB_db *db;
-	size_t need;
+	int16_t off;
 
 	if (!txn || !TXN_DBI_EXIST(txn, dbi, DB_USRVALID))
 		return EINVAL;
@@ -14964,16 +15008,18 @@ mdb_set_hash_offset(MDB_txn *txn, MDB_dbi dbi, unsigned hash_offset)
 	if (db->md_root != P_INVALID || db->md_entries != 0 || db->md_depth != 0)
 		return MDB_INCOMPATIBLE;
 
-	if (hash_offset > 0xFFFFu)
+	if (hash_offset < INT16_MIN || hash_offset > INT16_MAX)
 		return EINVAL;
+	off = (int16_t)hash_offset;
 
-	need = (size_t)hash_offset + (size_t)MDB_HASH_SIZE;
+	/* If DUPFIXED already has a fixed size, it must be large enough for the slice. */
+	if ((db->md_flags & MDB_DUPFIXED) && db->md_pad) {
+		size_t start;
+		if (mdb_hashslice_start((size_t)db->md_pad, off, &start))
+			return MDB_BAD_VALSIZE;
+	}
 
-	/* If DUPFIXED already has a fixed size, it must be large enough. */
-	if ((db->md_flags & MDB_DUPFIXED) && db->md_pad && (size_t)db->md_pad < need)
-		return MDB_BAD_VALSIZE;
-
-	db->md_hash_offset = (uint16_t)hash_offset;
+	db->md_hash_offset = off;
 
 	/* Ensure MDB_db persists on commit. */
 	txn->mt_dbflags[dbi] |= DB_DIRTY;
@@ -14984,7 +15030,7 @@ mdb_set_hash_offset(MDB_txn *txn, MDB_dbi dbi, unsigned hash_offset)
 
 
 int ESECT
-mdb_get_hash_offset(MDB_txn *txn, MDB_dbi dbi, unsigned *hash_offset)
+mdb_get_hash_offset(MDB_txn *txn, MDB_dbi dbi, int *hash_offset)
 {
 	MDB_db *db;
 
@@ -14997,7 +15043,7 @@ mdb_get_hash_offset(MDB_txn *txn, MDB_dbi dbi, unsigned *hash_offset)
 	if (!(DB_AGGFLAGS(db) & MDB_AGG_HASHSUM))
 		return MDB_INCOMPATIBLE;
 
-	*hash_offset = (unsigned)db->md_hash_offset;
+	*hash_offset = (int)db->md_hash_offset;
 	return MDB_SUCCESS;
 }
 
@@ -15150,22 +15196,23 @@ mdb_agg_add_leaf_node_full(MDB_cursor *mc, MDB_page *leaf, MDB_node *node, MDB_a
 		if (!F_ISSET(node->mn_flags, F_DUPDATA)) {
 			MDB_val vv = {0};
 			int rc;
+			const uint8_t *hs;
 
 			if (mdb_hashsum_source_is_key(mc)) {
 				/* hash-from-key (or values-as-keys in C_SUB) */
 				vv.mv_size = NODEKSZ(node);
 				vv.mv_data = NODEKEY(leaf, node);
-				if (vv.mv_size < MDB_HASH_NEED(mc->mc_db))
-					return mdb_agg_corrupt(mc, "prefix_hash_key_too_small", leaf, NULL, leaf->mp_pgno);
 			} else {
 				rc = mdb_node_read(mc, node, &vv);
 				if (rc)
 					return rc;
-				if (vv.mv_size < MDB_HASH_NEED(mc->mc_db))
-					return mdb_agg_corrupt(mc, "prefix_hash_value_too_small", leaf, NULL, leaf->mp_pgno);
 			}
-
-			mdb_hashsum_add(hs_acc, (const uint8_t *)vv.mv_data + mc->mc_db->md_hash_offset);
+			rc = mdb_hashslice_ptr_bytes(vv.mv_data, vv.mv_size, mc->mc_db->md_hash_offset, &hs);
+			if (rc)
+				return mdb_agg_corrupt(mc,
+					mdb_hashsum_source_is_key(mc) ? "prefix_hash_key_too_small" : "prefix_hash_value_too_small",
+					leaf, NULL, leaf->mp_pgno);
+			mdb_hashsum_add(hs_acc, hs);
 			return MDB_SUCCESS;
 		}
 
@@ -15196,20 +15243,22 @@ mdb_agg_add_leaf_node_full(MDB_cursor *mc, MDB_page *leaf, MDB_node *node, MDB_a
 
 			if (IS_LEAF2(sp)) {
 				unsigned ksize = sp->mp_pad;
-				if ((size_t)ksize < MDB_HASH_NEED(mc->mc_db))
+				size_t hstart;
+				if (mdb_hashslice_start((size_t)ksize, mc->mc_db->md_hash_offset, &hstart))
 					return mdb_agg_corrupt(mc, "prefix_hash_subleaf2_key_too_small", leaf, sp, leaf->mp_pgno);
 				for (j = 0; j < NUMKEYS(sp); j++)
-					mdb_hashsum_add(hs_acc, (const uint8_t *)LEAF2KEY(sp, j, ksize) + mc->mc_db->md_hash_offset);
+					mdb_hashsum_add(hs_acc, (const uint8_t *)LEAF2KEY(sp, j, ksize) + hstart);
 			} else {
 				for (j = 0; j < NUMKEYS(sp); j++) {
 					MDB_node *ln = NODEPTR(sp, j);
 					MDB_val vv;
+					const uint8_t *hs;
 
 					vv.mv_size = NODEKSZ(ln);
 					vv.mv_data = NODEKEY(sp, ln);
-					if (vv.mv_size < MDB_HASH_NEED(mc->mc_db))
+					if (mdb_hashslice_ptr_bytes(vv.mv_data, vv.mv_size, mc->mc_db->md_hash_offset, &hs))
 						return mdb_agg_corrupt(mc, "prefix_hash_subleaf_key_too_small", leaf, sp, leaf->mp_pgno);
-					mdb_hashsum_add(hs_acc, (const uint8_t *)vv.mv_data + mc->mc_db->md_hash_offset);
+					mdb_hashsum_add(hs_acc, hs);
 				}
 			}
 			return MDB_SUCCESS;
@@ -15490,10 +15539,11 @@ mdb_agg_prefix_key_cursor(MDB_cursor *cur, const MDB_val *key, unsigned incl,
 
 		if (IS_LEAF2(lp)) {
 			unsigned ksize = lp->mp_pad;
+			size_t hstart = 0;
 
 			if ((agg & MDB_AGG_HASHSUM) && !(cur->mc_flags & C_SUB))
 				return MDB_INCOMPATIBLE;
-			if ((agg & MDB_AGG_HASHSUM) && ((size_t)ksize < MDB_HASH_NEED(cur->mc_db)))
+			if ((agg & MDB_AGG_HASHSUM) && mdb_hashslice_start((size_t)ksize, cur->mc_db->md_hash_offset, &hstart))
 				return mdb_agg_corrupt(cur, "prefix_leaf2_key_too_small", lp, NULL, lp->mp_pgno);
 
 			for (i = 0; i < stop; i++) {
@@ -15509,7 +15559,7 @@ mdb_agg_prefix_key_cursor(MDB_cursor *cur, const MDB_val *key, unsigned incl,
 				}
 				if (agg & MDB_AGG_HASHSUM) {
 					const uint8_t *p = (const uint8_t *)LEAF2KEY(lp, i, ksize);
-					mdb_hashsum_add(mdb_agg_hashsum_ptr(agg, out), p + cur->mc_db->md_hash_offset);
+					mdb_hashsum_add(mdb_agg_hashsum_ptr(agg, out), p + hstart);
 				}
 			}
 
@@ -15526,7 +15576,7 @@ mdb_agg_prefix_key_cursor(MDB_cursor *cur, const MDB_val *key, unsigned incl,
 				}
 				if (agg & MDB_AGG_HASHSUM) {
 					const uint8_t *p = (const uint8_t *)LEAF2KEY(lp, stop, ksize);
-					mdb_hashsum_add(mdb_agg_hashsum_ptr(agg, out), p + cur->mc_db->md_hash_offset);
+					mdb_hashsum_add(mdb_agg_hashsum_ptr(agg, out), p + hstart);
 				}
 			}
 		} else if (IS_LEAF(lp)) {
@@ -15810,9 +15860,10 @@ mdb_agg_add_leaf_node_partial_dups(MDB_cursor *mc, MDB_page *leaf, MDB_node *nod
 			return rc;
 
 		for (i = 0; i < take; i++) {
-			if (dk.mv_size < MDB_HASH_NEED(mc->mc_db))
+			const uint8_t *hs;
+			if (mdb_hashslice_ptr_bytes(dk.mv_data, dk.mv_size, mc->mc_db->md_hash_offset, &hs))
 				return mdb_agg_corrupt(mc, "rank_prefix_dupdb_key_too_small", leaf, NULL, leaf->mp_pgno);
-			mdb_hashsum_add(hs_acc, (const uint8_t *)dk.mv_data + mc->mc_db->md_hash_offset);
+			mdb_hashsum_add(hs_acc, hs);
 
 			if (i + 1 == take)
 				break;
@@ -15830,22 +15881,24 @@ mdb_agg_add_leaf_node_partial_dups(MDB_cursor *mc, MDB_page *leaf, MDB_node *nod
 
 		if (IS_LEAF2(sp)) {
 			unsigned ksize = sp->mp_pad;
-			if ((size_t)ksize < MDB_HASH_NEED(mc->mc_db))
+			size_t hstart;
+			if (mdb_hashslice_start((size_t)ksize, mc->mc_db->md_hash_offset, &hstart))
 				return mdb_agg_corrupt(mc, "rank_prefix_dupsubleaf2_key_too_small", leaf, sp, leaf->mp_pgno);
 			for (i = 0; i < take; i++) {
 				const uint8_t *p = (const uint8_t *)LEAF2KEY(sp, (indx_t)i, ksize);
-				mdb_hashsum_add(hs_acc, p + mc->mc_db->md_hash_offset);
+				mdb_hashsum_add(hs_acc, p + hstart);
 			}
 		} else {
 			for (i = 0; i < take; i++) {
 				MDB_node *ln = NODEPTR(sp, (indx_t)i);
 				MDB_val vv;
+				const uint8_t *hs;
 
 				vv.mv_size = NODEKSZ(ln);
 				vv.mv_data = NODEKEY(sp, ln);
-				if (vv.mv_size < MDB_HASH_NEED(mc->mc_db))
+				if (mdb_hashslice_ptr_bytes(vv.mv_data, vv.mv_size, mc->mc_db->md_hash_offset, &hs))
 					return mdb_agg_corrupt(mc, "rank_prefix_dupsubleaf_key_too_small", leaf, sp, leaf->mp_pgno);
-				mdb_hashsum_add(hs_acc, (const uint8_t *)vv.mv_data + mc->mc_db->md_hash_offset);
+				mdb_hashsum_add(hs_acc, hs);
 			}
 		}
 	}
@@ -15965,12 +16018,13 @@ mdb_agg_prefix_rank_entries_internal(MDB_txn *txn, MDB_dbi dbi, uint64_t nentrie
 	if (IS_LEAF2(mp)) {
 		unsigned ksize = mp->mp_pad;
 		indx_t i;
+		size_t hstart = 0;
 
 		if ((agg & MDB_AGG_HASHSUM) && !(mc.mc_flags & C_SUB)) {
 			MDB_CURSOR_UNREF(&mc, 0);
 			return MDB_INCOMPATIBLE;
 		}
-		if ((agg & MDB_AGG_HASHSUM) && ((size_t)ksize < MDB_HASH_NEED(mc.mc_db))) {
+		if ((agg & MDB_AGG_HASHSUM) && mdb_hashslice_start((size_t)ksize, mc.mc_db->md_hash_offset, &hstart)) {
 			MDB_CURSOR_UNREF(&mc, 0);
 			return mdb_agg_corrupt(&mc, "rank_prefix_leaf2_key_too_small", mp, NULL, mp->mp_pgno);
 		}
@@ -15986,7 +16040,7 @@ mdb_agg_prefix_rank_entries_internal(MDB_txn *txn, MDB_dbi dbi, uint64_t nentrie
 			}
 			if (agg & MDB_AGG_HASHSUM) {
 				const uint8_t *p = (const uint8_t *)LEAF2KEY(mp, i, ksize);
-				mdb_hashsum_add(mdb_agg_hashsum_ptr(agg, out), p + mc.mc_db->md_hash_offset);
+				mdb_hashsum_add(mdb_agg_hashsum_ptr(agg, out), p + hstart);
 			}
 		}
 
@@ -17323,24 +17377,26 @@ mdb_dbg_leaf_node_agg(MDB_cursor *mc, MDB_page *leaf, MDB_node *node,
 				values_as_keys = 1;
 			if (values_as_keys) {
 				/* values-as-keys */
-				if (NODEKSZ(node) < MDB_HASH_NEED(mc->mc_db)) {
+				size_t hstart;
+				if (mdb_hashslice_start(NODEKSZ(node), mc->mc_db->md_hash_offset, &hstart)) {
 					(*mismatches)++;
 					MDB_AGG_DBG_PRINTF("[AGG HASHSUM VALSIZE] dup-sub value size=%u < MDB_HASH_SIZE=%u\n",
 						(unsigned)NODEKSZ(node), (unsigned)MDB_HASH_SIZE);
 				} else {
-					mdb_hashsum_add(out.hashsum, (const uint8_t *)NODEKEY(leaf, node) + mc->mc_db->md_hash_offset);
+					mdb_hashsum_add(out.hashsum, (const uint8_t *)NODEKEY(leaf, node) + hstart);
 				}
 			} else {
 				MDB_val vv = {0};
+				size_t hstart;
 				*rc = mdb_node_read(mc, node, &vv);
 				if (*rc)
 					return (MDB_dbg_ek){0,0,{0}};
-				if (vv.mv_size < MDB_HASH_NEED(mc->mc_db)) {
+				if (mdb_hashslice_start(vv.mv_size, mc->mc_db->md_hash_offset, &hstart)) {
 					(*mismatches)++;
 					MDB_AGG_DBG_PRINTF("[AGG HASHSUM VALSIZE] value size=%"Z"u < MDB_HASH_SIZE=%u\n",
 						vv.mv_size, (unsigned)MDB_HASH_SIZE);
 				} else {
-					mdb_hashsum_add(out.hashsum, (const uint8_t *)vv.mv_data + mc->mc_db->md_hash_offset);
+					mdb_hashsum_add(out.hashsum, (const uint8_t *)vv.mv_data + hstart);
 				}
 			}
 		}
@@ -17397,15 +17453,18 @@ mdb_dbg_count_page_ek(MDB_cursor *mc, MDB_page *mp, int *rc, unsigned *mismatche
 				MDB_AGG_DBG_PRINTF(
 					"[AGG HASHSUM UNSUPPORTED] hashsum on LEAF2 without C_SUB (pgno=%"Yu")\n",
 					mp->mp_pgno);
-			} else if ((size_t)mp->mp_pad < MDB_HASH_NEED(mc->mc_db)) {
+			} else {
+				size_t hstart;
+				if (mdb_hashslice_start((size_t)mp->mp_pad, mc->mc_db->md_hash_offset, &hstart)) {
 				(*mismatches)++;
 				MDB_AGG_DBG_PRINTF(
 					"[AGG HASHSUM VALSIZE] LEAF2 ksize=%u < MDB_HASH_SIZE=%u (pgno=%"Yu")\n",
 					(unsigned)mp->mp_pad, (unsigned)MDB_HASH_SIZE, mp->mp_pgno);
-			} else {
-				for (i = 0; i < n; i++) {
-					const uint8_t *p = (const uint8_t *)LEAF2KEY(mp, i, mp->mp_pad);
-					mdb_hashsum_add(total.hashsum, p + mc->mc_db->md_hash_offset);
+				} else {
+					for (i = 0; i < n; i++) {
+						const uint8_t *p = (const uint8_t *)LEAF2KEY(mp, i, mp->mp_pad);
+						mdb_hashsum_add(total.hashsum, p + hstart);
+					}
 				}
 			}
 		}
@@ -17548,8 +17607,7 @@ mdb_dbg_cursor_hashsum_all(MDB_txn *txn, MDB_dbi dbi, uint8_t out[MDB_HASH_SIZE]
 	MDB_cursor *cur = NULL;
 	MDB_val k, v;
 	const MDB_db *db;
-	size_t need;
-	uint16_t off;
+	int16_t off;
 	int rc;
 	int from_key;
 
@@ -17559,7 +17617,6 @@ mdb_dbg_cursor_hashsum_all(MDB_txn *txn, MDB_dbi dbi, uint8_t out[MDB_HASH_SIZE]
 		return EINVAL;
 
 	db = &txn->mt_dbs[dbi];
-	need = MDB_HASH_NEED(db);
 	off = db->md_hash_offset;
 	from_key = (db->md_flags & MDB_AGG_HASHSOURCE_FROM_KEY) != 0;
 
@@ -17570,11 +17627,14 @@ mdb_dbg_cursor_hashsum_all(MDB_txn *txn, MDB_dbi dbi, uint8_t out[MDB_HASH_SIZE]
 	rc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
 	while (rc == MDB_SUCCESS) {
 		const MDB_val *src = from_key ? &k : &v;
-		if (src->mv_size < need) {
-			mdb_cursor_close(cur);
-			return MDB_BAD_VALSIZE;
+		{
+			size_t hstart;
+			if (mdb_hashslice_start(src->mv_size, off, &hstart)) {
+				mdb_cursor_close(cur);
+				return MDB_BAD_VALSIZE;
+			}
+			mdb_hashsum_add(out, (const uint8_t *)src->mv_data + hstart);
 		}
-		mdb_hashsum_add(out, (const uint8_t *)src->mv_data + off);
 		rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
 	}
 	if (rc == MDB_NOTFOUND)

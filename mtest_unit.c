@@ -212,6 +212,141 @@ static void test_hashsum_algebra(void)
     }
 }
 
+static void test_hashslice_extract(void)
+{
+    /* This test targets the unified hashslice extraction helpers:
+     *  - pointer-returning extraction (no memcpy)
+     *  - copy-out extraction (memcpy)
+     *
+     * And it exercises the signed md_hash_offset semantics:
+     *  off >= 0  => from beginning (0 == first bytes)
+     *  off <  0  => from end (-1 == last bytes)
+     */
+
+    uint8_t buf[(size_t)MDB_HASH_SIZE + 64u];
+    for (unsigned i = 0; i < sizeof(buf); i++)
+        buf[i] = (uint8_t)i;
+
+    const size_t sz = sizeof(buf);
+    uint8_t out[MDB_HASH_SIZE];
+    const uint8_t *p = NULL;
+    int rc;
+
+    /* --- from beginning: off = 0 --- */
+    rc = mdb_hashslice_ptr_bytes(buf, sz, (int16_t)0, &p);
+    REQUIRE(rc == MDB_SUCCESS, "hashslice: ptr off=0 failed");
+    REQUIRE(p == buf, "hashslice: ptr off=0 points wrong");
+    rc = mdb_hashslice_copy_bytes(buf, sz, (int16_t)0, out);
+    REQUIRE(rc == MDB_SUCCESS, "hashslice: copy off=0 failed");
+    REQUIRE(memcmp(out, buf, MDB_HASH_SIZE) == 0, "hashslice: copy off=0 mismatch");
+
+    /* --- from beginning: positive off --- */
+    {
+        const int16_t off = 7;
+        rc = mdb_hashslice_ptr_bytes(buf, sz, off, &p);
+        REQUIRE(rc == MDB_SUCCESS, "hashslice: ptr off=7 failed");
+        REQUIRE(p == buf + off, "hashslice: ptr off=7 points wrong");
+        rc = mdb_hashslice_copy_bytes(buf, sz, off, out);
+        REQUIRE(rc == MDB_SUCCESS, "hashslice: copy off=7 failed");
+        REQUIRE(memcmp(out, buf + off, MDB_HASH_SIZE) == 0, "hashslice: copy off=7 mismatch");
+    }
+
+    /* --- from beginning: last valid start (off = sz - MDB_HASH_SIZE) --- */
+    {
+        const int16_t off = (int16_t)(sz - (size_t)MDB_HASH_SIZE);
+        rc = mdb_hashslice_ptr_bytes(buf, sz, off, &p);
+        REQUIRE(rc == MDB_SUCCESS, "hashslice: ptr off=last_valid failed");
+        REQUIRE(p == buf + (size_t)off, "hashslice: ptr off=last_valid points wrong");
+        rc = mdb_hashslice_copy_bytes(buf, sz, off, out);
+        REQUIRE(rc == MDB_SUCCESS, "hashslice: copy off=last_valid failed");
+        REQUIRE(memcmp(out, buf + (size_t)off, MDB_HASH_SIZE) == 0, "hashslice: copy off=last_valid mismatch");
+    }
+
+    /* --- from beginning: invalid start (off too large) --- */
+    {
+        const int16_t off = (int16_t)(sz - (size_t)MDB_HASH_SIZE + 1u);
+        rc = mdb_hashslice_ptr_bytes(buf, sz, off, &p);
+        REQUIRE(rc == MDB_BAD_VALSIZE, "hashslice: ptr off=too_large should fail");
+        rc = mdb_hashslice_copy_bytes(buf, sz, off, out);
+        REQUIRE(rc == MDB_BAD_VALSIZE, "hashslice: copy off=too_large should fail");
+    }
+
+    /* --- from end: off = -1 means "use last bytes" --- */
+    {
+        const int16_t off = (int16_t)-1;
+        const uint8_t *exp = buf + (sz - (size_t)MDB_HASH_SIZE);
+        rc = mdb_hashslice_ptr_bytes(buf, sz, off, &p);
+        REQUIRE(rc == MDB_SUCCESS, "hashslice: ptr off=-1 failed");
+        REQUIRE(p == exp, "hashslice: ptr off=-1 points wrong");
+        rc = mdb_hashslice_copy_bytes(buf, sz, off, out);
+        REQUIRE(rc == MDB_SUCCESS, "hashslice: copy off=-1 failed");
+        REQUIRE(memcmp(out, exp, MDB_HASH_SIZE) == 0, "hashslice: copy off=-1 mismatch");
+    }
+
+    /* --- from end: off = -3 means shift 2 bytes earlier than the last block --- */
+    {
+        const int16_t off = (int16_t)-3;
+        const size_t start = (sz - (size_t)MDB_HASH_SIZE) - 2u;
+        const uint8_t *exp = buf + start;
+        rc = mdb_hashslice_ptr_bytes(buf, sz, off, &p);
+        REQUIRE(rc == MDB_SUCCESS, "hashslice: ptr off=-3 failed");
+        REQUIRE(p == exp, "hashslice: ptr off=-3 points wrong");
+        rc = mdb_hashslice_copy_bytes(buf, sz, off, out);
+        REQUIRE(rc == MDB_SUCCESS, "hashslice: copy off=-3 failed");
+        REQUIRE(memcmp(out, exp, MDB_HASH_SIZE) == 0, "hashslice: copy off=-3 mismatch");
+    }
+
+    /* --- from end: invalid (shift too far, start < 0) --- */
+    {
+        /* start = sz - MDB_HASH_SIZE + off + 1; make it negative */
+        const int16_t off = (int16_t)(-(int)(sz - (size_t)MDB_HASH_SIZE) - 2);
+        rc = mdb_hashslice_ptr_bytes(buf, sz, off, &p);
+        REQUIRE(rc == MDB_BAD_VALSIZE, "hashslice: ptr off=too_negative should fail");
+        rc = mdb_hashslice_copy_bytes(buf, sz, off, out);
+        REQUIRE(rc == MDB_BAD_VALSIZE, "hashslice: copy off=too_negative should fail");
+    }
+
+    /* --- size corner-cases --- */
+    {
+        /* Exactly MDB_HASH_SIZE bytes: off=0 and off=-1 both valid and point to the same start. */
+        uint8_t exact[MDB_HASH_SIZE];
+        for (unsigned i = 0; i < MDB_HASH_SIZE; i++)
+            exact[i] = (uint8_t)(0xA0u ^ i);
+
+        rc = mdb_hashslice_ptr_bytes(exact, (size_t)MDB_HASH_SIZE, (int16_t)0, &p);
+        REQUIRE(rc == MDB_SUCCESS, "hashslice: ptr exact off=0 failed");
+        REQUIRE(p == exact, "hashslice: ptr exact off=0 points wrong");
+        rc = mdb_hashslice_ptr_bytes(exact, (size_t)MDB_HASH_SIZE, (int16_t)-1, &p);
+        REQUIRE(rc == MDB_SUCCESS, "hashslice: ptr exact off=-1 failed");
+        REQUIRE(p == exact, "hashslice: ptr exact off=-1 points wrong");
+
+        /* But off=-2 must fail (would require start=-1). */
+        rc = mdb_hashslice_ptr_bytes(exact, (size_t)MDB_HASH_SIZE, (int16_t)-2, &p);
+        REQUIRE(rc == MDB_BAD_VALSIZE, "hashslice: ptr exact off=-2 should fail");
+    }
+
+#if MDB_HASH_SIZE > 1
+    {
+        /* Too small: always fails. */
+        uint8_t tiny[MDB_HASH_SIZE - 1u];
+        rc = mdb_hashslice_ptr_bytes(tiny, sizeof(tiny), (int16_t)0, &p);
+        REQUIRE(rc == MDB_BAD_VALSIZE, "hashslice: ptr tiny off=0 should fail");
+        rc = mdb_hashslice_ptr_bytes(tiny, sizeof(tiny), (int16_t)-1, &p);
+        REQUIRE(rc == MDB_BAD_VALSIZE, "hashslice: ptr tiny off=-1 should fail");
+        rc = mdb_hashslice_copy_bytes(tiny, sizeof(tiny), (int16_t)0, out);
+        REQUIRE(rc == MDB_BAD_VALSIZE, "hashslice: copy tiny off=0 should fail");
+        rc = mdb_hashslice_copy_bytes(tiny, sizeof(tiny), (int16_t)-1, out);
+        REQUIRE(rc == MDB_BAD_VALSIZE, "hashslice: copy tiny off=-1 should fail");
+    }
+#endif
+
+    /* NULL pointer must fail. */
+    rc = mdb_hashslice_ptr_bytes(NULL, sz, (int16_t)0, &p);
+    REQUIRE(rc == MDB_BAD_VALSIZE, "hashslice: ptr NULL should fail");
+    rc = mdb_hashslice_copy_bytes(NULL, sz, (int16_t)0, out);
+    REQUIRE(rc == MDB_BAD_VALSIZE, "hashslice: copy NULL should fail");
+}
+
 static void fatal_errno(const char *msg)
 {
     fprintf(stderr, "%s: %s\n", msg, strerror(errno));
@@ -2143,6 +2278,101 @@ static void test_plain_merge_update_key_growth_split(void)
     CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn), "plain merge updatekey: ro begin");
     verify_against_oracle(txn, dbi, "plain merge updatekey (ro)");
     mdb_txn_abort(txn);
+
+    mdb_dbi_close(env, dbi);
+    mdb_env_close(env);
+}
+
+static void test_plain_hashsum_key_end_offset(void)
+{
+    /* Plain DBI, key-source hashsum, with the hash bytes located at the *end* of the key.
+     *
+     * Requires:
+     *  - MDB_AGG_HASHSOURCE_FROM_KEY
+     *  - md_hash_offset semantics: -1 means "use last MDB_HASH_SIZE bytes"
+     */
+    char dir[256];
+    make_test_dir(dir, sizeof(dir), "t08b_plain_keyhash_end");
+    MDB_env *env = open_env_dir(dir, 8, 96u * 1024u * 1024u, 1);
+
+    MDB_txn *txn = NULL;
+    MDB_dbi dbi;
+
+    const unsigned schema = (MDB_AGG_ENTRIES | MDB_AGG_KEYS | MDB_AGG_HASHSUM | MDB_AGG_HASHSOURCE_FROM_KEY);
+
+    CHECK(mdb_txn_begin(env, NULL, 0, &txn), "keyhash end: begin");
+    CHECK(mdb_dbi_open(txn, "plain", MDB_CREATE | schema, &dbi), "keyhash end: open");
+
+    /* -1 => "no offset from end": use the last bytes */
+    CHECK(mdb_set_hash_offset(txn, dbi, -1), "keyhash end: set_hash_offset(-1)");
+
+    uint8_t exp[MDB_HASH_SIZE];
+    uint8_t wrong[MDB_HASH_SIZE];
+    uint8_t tmp[MDB_HASH_SIZE];
+    memset(exp, 0, sizeof(exp));
+    memset(wrong, 0, sizeof(wrong));
+
+    const unsigned N = 50;
+    const size_t prefix = (size_t)MDB_HASH_SIZE + 16u; /* ensure the first MDB_HASH_SIZE bytes are *not* hash bytes */
+    uint8_t keybuf[(MDB_HASH_SIZE * 2u) + 32u];
+
+    for (unsigned i = 0; i < N; i++) {
+        /* key = [prefix bytes][hash bytes] */
+        fill_prefix_bytes(keybuf, prefix, ((uint64_t)i << 1) ^ 0x123456789ABCDEF0ULL);
+        fill_hash_prefix(keybuf + prefix, ((uint64_t)i << 32) ^ 0xA55AA55Au);
+
+        MDB_val k = { prefix + (size_t)MDB_HASH_SIZE, keybuf };
+
+        uint8_t dv = (uint8_t)(i ^ 0x5Au);
+        MDB_val d = { 1u, &dv };
+
+        /* expected hashsum sums the hash-at-end bytes */
+        fill_hash_prefix(tmp, ((uint64_t)i << 32) ^ 0xA55AA55Au);
+        mdb_hashsum_add(exp, tmp);
+
+        /* "wrong" oracle: sum from the beginning (first MDB_HASH_SIZE bytes, prefix-only) */
+        mdb_hashsum_add(wrong, keybuf);
+
+        CHECK(mdb_put(txn, dbi, &k, &d, 0), "keyhash end: put");
+        if ((i & 15u) == 0u) DBG_CHECK(txn, dbi, "keyhash end: dbg");
+    }
+
+    /* Overwrite a value: key-source hashsum must *not* change. */
+    {
+        const unsigned i = 7u;
+        fill_prefix_bytes(keybuf, prefix, ((uint64_t)i << 1) ^ 0x123456789ABCDEF0ULL);
+        fill_hash_prefix(keybuf + prefix, ((uint64_t)i << 32) ^ 0xA55AA55Au);
+        MDB_val k = { prefix + (size_t)MDB_HASH_SIZE, keybuf };
+
+        uint8_t dv = 0xEE;
+        MDB_val d = { 1u, &dv };
+
+        CHECK(mdb_put(txn, dbi, &k, &d, 0), "keyhash end: overwrite value");
+        DBG_CHECK(txn, dbi, "keyhash end: dbg after overwrite");
+    }
+
+    {
+        MDB_agg got;
+        CHECK(mdb_agg_totals(txn, dbi, &got), "keyhash end: totals");
+        agg_expect_flags("keyhash end: flags", got.mv_flags, schema);
+        REQUIRE(got.mv_agg_entries == (uint64_t)N, "keyhash end: expected entries==N");
+        REQUIRE(got.mv_agg_keys == (uint64_t)N, "keyhash end: expected keys==N");
+        REQUIRE(memcmp(got.mv_agg_hashes, exp, MDB_HASH_SIZE) == 0, "keyhash end: totals hashsum mismatch");
+        REQUIRE(memcmp(got.mv_agg_hashes, wrong, MDB_HASH_SIZE) != 0, "keyhash end: totals unexpectedly matches prefix-sum");
+    }
+
+    CHECK(mdb_txn_commit(txn), "keyhash end: commit");
+
+    /* Re-check persistence on a read txn. */
+    {
+        MDB_txn *rtxn = NULL;
+        CHECK(mdb_txn_begin(env, NULL, MDB_RDONLY, &rtxn), "keyhash end: ro begin");
+        MDB_agg got;
+        CHECK(mdb_agg_totals(rtxn, dbi, &got), "keyhash end: totals ro");
+        agg_expect_flags("keyhash end: flags ro", got.mv_flags, schema);
+        REQUIRE(memcmp(got.mv_agg_hashes, exp, MDB_HASH_SIZE) == 0, "keyhash end: totals ro hashsum mismatch");
+        mdb_txn_abort(rtxn);
+    }
 
     mdb_dbi_close(env, dbi);
     mdb_env_close(env);
@@ -5303,6 +5533,7 @@ int main(void)
 {
     const Test tests[] = {
         {"hashsum algebra", test_hashsum_algebra},
+        {"hashslice extract", test_hashslice_extract},
         {"plain right splis", test_plain_rightsplit},
         {"plain left splits", test_plain_leftsplit},
         {"plain middle fill", test_plain_middlefill},
@@ -5312,6 +5543,7 @@ int main(void)
         {"plain overflow values", test_plain_overflow_values_hashsum},
         {"plain deep split/merge oscillation", test_plain_deep_split_merge_oscillation},
         {"plain merge update_key growth", test_plain_merge_update_key_growth_split},
+        {"plain hashsum key end offset", test_plain_hashsum_key_end_offset},
         {"regress del big overflow same-txn", test_regress_del_bigdata_same_txn_after_freelist_loaded},
         {"dupsort divergence", test_dupsort_divergence},
         {"dupsort round robin", test_dupsort_round_robin},

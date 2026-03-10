@@ -171,6 +171,7 @@
 #include <limits.h>
 #include <string.h> /*memcpy*/
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -1748,13 +1749,19 @@ int mdb_agg_info(MDB_txn *txn, MDB_dbi dbi, unsigned *agg_flags);
 /** @brief Configure the hash offset for a HASHSUM-enabled DBI.
  *
  * For DBIs created with #MDB_AGG_HASHSUM, the hashsum is computed by summing
- * #MDB_HASH_SIZE bytes starting at a per-DB offset within each logical hash source
- * (value by default; key when #MDB_AGG_HASHSOURCE_FROM_KEY is set).
+ * #MDB_HASH_SIZE bytes selected from each logical hash source (value by default;
+ * key when #MDB_AGG_HASHSOURCE_FROM_KEY is set).
+ *
+ * Hash offset semantics:
+ *  - If @p hash_offset is non-negative, it is an offset from the beginning
+ *    of the logical hash source (0 means "use the first bytes").
+ *  - If @p hash_offset is negative, it is an offset from the end
+ *    (-1 means "use the last bytes", -2 means "start one byte earlier", etc.).
  *
  * This function sets that per-DB offset. It must be called in a write transaction,
  * and only on an empty DBI (no root/entries).
  */
-int mdb_set_hash_offset(MDB_txn *txn, MDB_dbi dbi, unsigned hash_offset);
+int mdb_set_hash_offset(MDB_txn *txn, MDB_dbi dbi, int hash_offset);
 
 /** @brief Get the configured hash offset for a HASHSUM-enabled DBI.
  *
@@ -1766,7 +1773,7 @@ int mdb_set_hash_offset(MDB_txn *txn, MDB_dbi dbi, unsigned hash_offset);
  * @param[out] hash_offset Receives the configured offset (bytes)
  * @return 0 on success, non-zero error value on failure.
  */
-int mdb_get_hash_offset(MDB_txn *txn, MDB_dbi dbi, unsigned *hash_offset);
+int mdb_get_hash_offset(MDB_txn *txn, MDB_dbi dbi, int *hash_offset);
 
 
 /** @brief Fetch total aggregates for the whole DBI. */
@@ -2004,26 +2011,6 @@ mdb_store_le64(uint8_t *p, uint64_t x) {
  *
  * @{
  */
-// static inline uint64_t
-// mdb_load_le64(const uint8_t *p)
-// {
-// 	return ((uint64_t)p[0]) | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
-// 	       ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) | ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
-// }
-
-// static inline void
-// mdb_store_le64(uint8_t *p, uint64_t x)
-// {
-// 	p[0] = (uint8_t)(x);
-// 	p[1] = (uint8_t)(x >> 8);
-// 	p[2] = (uint8_t)(x >> 16);
-// 	p[3] = (uint8_t)(x >> 24);
-// 	p[4] = (uint8_t)(x >> 32);
-// 	p[5] = (uint8_t)(x >> 40);
-// 	p[6] = (uint8_t)(x >> 48);
-// 	p[7] = (uint8_t)(x >> 56);
-// }
-
 /* Combined macros for addition/subtraction with carry/borrow */
 #if defined(__GNUC__) || defined(__clang__)
     /* GCC, Clang: use __builtin_add_overflow and __builtin_sub_overflow */
@@ -2106,55 +2093,6 @@ mdb_hashsum_sub(uint8_t *acc, const uint8_t *x)
     }
 }
 
-// /** @brief acc += x (mod 2^(8*MDB_HASH_SIZE)) */
-// static inline void
-// mdb_hashsum_add(uint8_t *acc, const uint8_t *x)
-// {
-// 	unsigned i;
-// 	uint64_t carry = 0;
-// 	for (i = 0; i < MDB_HASH_SIZE; i += 8) {
-// 		uint64_t a = mdb_load_le64(acc + i);
-// 		uint64_t b = mdb_load_le64(x + i);
-// 	#if defined(__SIZEOF_INT128__)
-// 		__uint128_t s = (__uint128_t)a + (__uint128_t)b + (__uint128_t)carry;
-// 		mdb_store_le64(acc + i, (uint64_t)s);
-// 		carry = (uint64_t)(s >> 64);
-// 	#else
-// 		uint64_t s = a + b;
-// 		uint64_t c1 = (s < a);
-// 		s += carry;
-// 		uint64_t c2 = (s < carry);
-// 		mdb_store_le64(acc + i, s);
-// 		carry = (c1 | c2);
-// 	#endif
-// 	}
-// }
-
-// static inline void
-// mdb_hashsum_sub(uint8_t *acc, const uint8_t *x)
-// {
-// 	unsigned i;
-// 	uint64_t borrow = 0;
-// 	for (i = 0; i < MDB_HASH_SIZE; i += 8) {
-// 		uint64_t a = mdb_load_le64(acc + i);
-// 		uint64_t b = mdb_load_le64(x + i);
-// 	#if defined(__SIZEOF_INT128__)
-// 		__uint128_t d = (__uint128_t)a - (__uint128_t)b - (__uint128_t)borrow;
-// 		mdb_store_le64(acc + i, (uint64_t)d);
-// 		{
-// 			__uint128_t bb = (__uint128_t)b + (__uint128_t)borrow;
-// 			borrow = ((__uint128_t)a < bb);
-// 		}
-// 	#else
-// 		uint64_t bb = b + borrow;
-// 		uint64_t bcarry = (bb < b);
-// 		uint64_t d = a - bb;
-// 		borrow = (a < bb) | bcarry;
-// 		mdb_store_le64(acc + i, d);
-// 	#endif
-// 	}
-// }
-
 /** @brief acc -= x (mod 2^(8*MDB_HASH_SIZE)) */
 static inline void
 mdb_hashsum_diff(uint8_t *out, const uint8_t *a, const uint8_t *b)
@@ -2185,76 +2123,73 @@ mdb_hashsum_is_zero(const uint8_t *p)
 	return !mdb_hashsum_nonzero_buf(p);
 }
 
-// /** @brief acc += x (mod 2^(8*MDB_HASH_SIZE)) */
-// static inline void
-// mdb_hashsum_add(uint8_t *acc, const uint8_t *x)
-// {
-// 	unsigned carry = 0;
-// 	unsigned i;
-// 	for (i = 0; i < MDB_HASH_SIZE; i++) {
-// 		unsigned s = (unsigned)acc[i] + (unsigned)x[i] + carry;
-// 		acc[i] = (uint8_t)s;
-// 		carry = s >> 8;
-// 	}
-// }
-
-// /** @brief acc -= x (mod 2^(8*MDB_HASH_SIZE)) */
-// static inline void
-// mdb_hashsum_sub(uint8_t *acc, const uint8_t *x)
-// {
-// 	unsigned borrow = 0;
-// 	unsigned i;
-// 	for (i = 0; i < MDB_HASH_SIZE; i++) {
-// 		unsigned xi = (unsigned)x[i] + borrow;
-// 		borrow = (unsigned)acc[i] < xi;
-// 		acc[i] = (uint8_t)((unsigned)acc[i] - xi);
-// 	}
-// }
-
-// /** @brief out = a - b (mod 2^(8*MDB_HASH_SIZE)) */
-// static inline void
-// mdb_hashsum_diff(uint8_t *out, const uint8_t *a, const uint8_t *b)
-// {
-// 	unsigned i;
-// 	for (i = 0; i < MDB_HASH_SIZE; i++)
-// 		out[i] = a[i];
-// 	mdb_hashsum_sub(out, b);
-// }
-
-// /** @brief Return nonzero if any byte of the hashsum buffer is nonzero. */
-// static inline int
-// mdb_hashsum_nonzero_buf(const uint8_t *p)
-// {
-// 	unsigned i;
-// 	for (i = 0; i < MDB_HASH_SIZE; i++)
-// 		if (p[i])
-// 			return 1;
-// 	return 0;
-// }
-
-// /** @brief Return nonzero if the hashsum buffer is all zeros. */
-// static inline int
-// mdb_hashsum_is_zero(const uint8_t *p)
-// {
-// 	return !mdb_hashsum_nonzero_buf(p);
-// }
-
-/** @brief Copy #MDB_HASH_SIZE bytes starting at @p off from @p p into @p out (validating size). */
+/**
+ * @brief Compute the start index of the selected hash slice within a byte buffer.
+ * This is the single authoritative interpreter for hash offsets used by AELMDB.
+ *
+ * Offset semantics:
+ *  - off >= 0: slice starts at byte offset @p off from the beginning.
+ *  - off <  0: slice starts at an offset from the end;
+ *              off == -1 selects the last #MDB_HASH_SIZE bytes.
+ */
 static inline int
-mdb_hashsum_extract_bytes(const void *p, size_t sz, size_t off, uint8_t out[MDB_HASH_SIZE])
+mdb_hashslice_start(size_t sz, int16_t off, size_t *start_out)
 {
-	unsigned i;
-	size_t need = off + (size_t)MDB_HASH_SIZE;
-	if (!p || sz < need)
+	ptrdiff_t start;
+	if (!start_out)
 		return MDB_BAD_VALSIZE;
-	for (i = 0; i < MDB_HASH_SIZE; i++)
-		out[i] = ((const uint8_t *)p)[off + i];
+	if (sz < (size_t)MDB_HASH_SIZE)
+		return MDB_BAD_VALSIZE;
+	if (off >= 0) {
+		start = (ptrdiff_t)off;
+	} else {
+		/* off==-1 => last bytes; off==-2 => one byte earlier, etc. */
+		start = (ptrdiff_t)sz - (ptrdiff_t)MDB_HASH_SIZE + 1 + (ptrdiff_t)off;
+	}
+	if (start < 0)
+		return MDB_BAD_VALSIZE;
+	if ((size_t)start + (size_t)MDB_HASH_SIZE > sz)
+		return MDB_BAD_VALSIZE;
+	*start_out = (size_t)start;
 	return MDB_SUCCESS;
+}
+
+/** @brief Get a pointer to the selected hash slice within a byte buffer (validating size). */
+static inline int
+mdb_hashslice_ptr_bytes(const void *p, size_t sz, int16_t off, const uint8_t **slice)
+{
+	size_t start;
+	int rc = mdb_hashslice_start(sz, off, &start);
+	if (rc)
+		return rc;
+	if (!p || !slice)
+		return MDB_BAD_VALSIZE;
+	*slice = ((const uint8_t *)p) + start;
+	return MDB_SUCCESS;
+}
+
+/** @brief Copy the selected hash slice into @p out (validating size). */
+static inline int
+mdb_hashslice_copy_bytes(const void *p, size_t sz, int16_t off, uint8_t out[MDB_HASH_SIZE])
+{
+	const uint8_t *slice;
+	int rc = mdb_hashslice_ptr_bytes(p, sz, off, &slice);
+	if (rc)
+		return rc;
+	memcpy(out, slice, MDB_HASH_SIZE);
+	return MDB_SUCCESS;
+}
+
+/** @brief Copy #MDB_HASH_SIZE selected bytes into @p out. */
+static inline int
+mdb_hashsum_extract_bytes(const void *p, size_t sz, int16_t off, uint8_t out[MDB_HASH_SIZE])
+{
+	return mdb_hashslice_copy_bytes(p, sz, off, out);
 }
 
 /** @brief Extract the hashsum bytes from a value (offset-aware). */
 static inline int
-mdb_hashsum_extract(const MDB_val *data, size_t off, uint8_t out[MDB_HASH_SIZE])
+mdb_hashsum_extract(const MDB_val *data, int16_t off, uint8_t out[MDB_HASH_SIZE])
 {
 	if (!data)
 		return MDB_BAD_VALSIZE;

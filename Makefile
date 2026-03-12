@@ -19,8 +19,8 @@ CXXWARN ?= $(filter-out -Wbad-function-cast,$(WARN))
 
 # Default to debug-friendly options used in this repo.
 # OPT      ?= -g -DMDB_DEBUG_AGG_PRINT -DMDB_DEBUG_AGG_INTEGRITY -DMDB_DEBUG
-OPT      ?= -g -DMDB_DEBUG_AGG_INTEGRITY
-# OPT     ?= -O3 -DNDEBUG
+# OPT      ?= -g -DMDB_DEBUG_AGG_INTEGRITY
+OPT     ?= -O3 -DNDEBUG
 # OPT      ?= -g -pg
 
 CPPFLAGS ?=

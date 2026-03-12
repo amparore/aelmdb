@@ -10936,24 +10936,24 @@ put_sub:
 
 					if (n > maxn)
 						n = maxn;
-						{
-							size_t hstart;
-							if (mdb_hashslice_start(sz, mc->mc_db->md_hash_offset, &hstart)) {
-								rc = MDB_BAD_VALSIZE;
-								goto bad_sub;
-							}
-							for (j = 0; j < n; j++, p += sz)
-								mdb_hashsum_add(hsdelta, p + hstart);
-						}
-				} else {
-					const MDB_val *vv = hs_from_key ? key : data;
-						const uint8_t *hs;
-						int trc = mdb_hashslice_ptr_bytes(vv->mv_data, vv->mv_size, mc->mc_db->md_hash_offset, &hs);
-						if (trc) {
-							rc = trc;
+					{
+						size_t hstart;
+						if (mdb_hashslice_start(sz, mc->mc_db->md_hash_offset, &hstart)) {
+							rc = MDB_BAD_VALSIZE;
 							goto bad_sub;
 						}
-						memcpy(hsdelta, hs, MDB_HASH_SIZE);
+						for (j = 0; j < n; j++, p += sz)
+							mdb_hashsum_add(hsdelta, p + hstart);
+					}
+				} else {
+					const MDB_val *vv = hs_from_key ? key : data;
+					const uint8_t *hs;
+					int trc = mdb_hashslice_ptr_bytes(vv->mv_data, vv->mv_size, mc->mc_db->md_hash_offset, &hs);
+					if (trc) {
+						rc = trc;
+						goto bad_sub;
+					}
+					memcpy(hsdelta, hs, MDB_HASH_SIZE);
 				}
 			} else if (!insert_data && (have_sub_tot_before || have_sub_oldhs)) {
 				/* Dup-container update (subpage or dup-subDB):

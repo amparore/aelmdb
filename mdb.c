@@ -2552,6 +2552,8 @@ int mdb_dbg_check_agg_db(MDB_txn *txn, MDB_dbi dbi);
 static int mdb_dbg_check_agg_txn_all(MDB_txn *txn);
 #endif /* MDB_DEBUG_AGG_INTEGRITY */
 
+/* Fast O(1) totals reader backed by embedded MDB_db totals. */
+static int mdb_agg_totals_internal(MDB_txn *txn, MDB_dbi dbi, MDB_aggval *out);
 
 /* Compute the subtree record count rooted at mp.
  *
@@ -15090,8 +15092,6 @@ mdb_agg_from_internal(uint16_t agg, const MDB_aggval *a, MDB_agg *out)
 int ESECT
 mdb_agg_totals(MDB_txn *txn, MDB_dbi dbi, MDB_agg *out)
 {
-	MDB_cursor mc = (MDB_cursor){0};
-	MDB_xcursor mx = (MDB_xcursor){0};
 	MDB_db *db;
 	uint16_t agg;
 	unsigned schema;
@@ -15112,28 +15112,28 @@ mdb_agg_totals(MDB_txn *txn, MDB_dbi dbi, MDB_agg *out)
 	mdb_agg_zero_public(schema, out);
 
 	/*
-	 * IMPORTANT: For named DBIs, txn->mt_dbs[dbi] may be DB_STALE in a fresh txn.
-	 * In that case md_root/md_entries may still be zero-filled until a cursor search
-	 * refreshes the DB record from MAIN_DBI. Therefore, do not short-circuit on
-	 * md_entries/md_root before forcing a root search.
+	 * Fast path: read the embedded MDB_db totals. This helper already handles
+	 * DB_STALE by forcing the minimal root-only refresh before reading the O(1)
+	 * totals snapshot.
 	 */
-	mdb_cursor_init(&mc, txn, dbi, (db->md_flags & MDB_DUPSORT) ? &mx : NULL);
-	rc = mdb_page_search(&mc, NULL, MDB_PS_ROOTONLY);
-	if (rc == MDB_NOTFOUND) {
-		MDB_CURSOR_UNREF(&mc, 0);
-		return MDB_SUCCESS; /* empty DB (after refresh) */
-	}
-	if (rc) {
-		MDB_CURSOR_UNREF(&mc, 0);
-		return rc;
-	}
-	rc = mdb_page_subtree_agg(&mc, mc.mc_pg[mc.mc_top], &a, MDB_AGG_SUBTREE_STRICT);
-	MDB_CURSOR_UNREF(&mc, 0);
+	rc = mdb_agg_totals_internal(txn, dbi, &a);
 	if (rc)
 		return rc;
 
 	mdb_agg_from_internal(agg, &a, out);
 	out->mv_flags = schema;
+
+	#ifdef MDB_DEBUG_AGG_INTEGRITY
+	/*
+	 * In integrity-debug builds, also run the full aggregate verifier. This is
+	 * intentionally stronger than the old strict subtree recomputation because it
+	 * checks stored branch aggregates as well as total counters/hashsum.
+	 */
+	rc = mdb_dbg_check_agg_db(txn, dbi);
+	if (rc)
+		return rc;
+	#endif
+
 	return MDB_SUCCESS;
 }
 

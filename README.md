@@ -4,7 +4,7 @@
 
 This enables:
 - **Order-statistics** on the database order (fast `rank` / `select`), extending the [order statistics-B-tree](https://en.wikipedia.org/wiki/Order_statistic_tree) design used in **[DLMDB](https://github.com/datalevin/dlmdb)**
-- **Fast range summaries** (counts + fixed-size **hash sums**) that are composable and efficient for large datasets
+- **Fast range summaries** (counts + fixed-size **hashsums**) that are composable and efficient for large datasets
 - **Anti-entropy / reconciliation-friendly primitives**, specifically targeting **Range-Based Set Reconciliation ([RBSR](https://logperiodic.com/rbsr.html))**, where you repeatedly compare and split ordered ranges using compact aggregates
 
 
@@ -42,7 +42,7 @@ These flags (passed to `mdb_dbi_open()`) select which aggregate components are m
 
 ## Hash slice definition
 
-When `MDB_AGG_HASHSUM` is enabled, AELMDB assumes that each record (entry) contains a fixed-size **hash slice**—a contiguous byte window that will be summed into the range fingerprint.
+When `MDB_AGG_HASHSUM` is enabled, AELMDB assumes that each record (entry) contains a fixed-size **hash slice**—a contiguous byte window that will be summed into the range hashsum.
 For every entry, AELMDB extracts exactly **`MDB_HASH_SIZE` bytes**:
 
 * **From where (hash source):**
@@ -92,19 +92,19 @@ When you open (or create) a DBI, you choose an **aggregate schema** by OR-ing `M
 If you enable `MDB_AGG_HASHSUM`, you must also configure **where the hash slice lives** inside the chosen hash source (value by default, or key in key-hash mode) using `mdb_set_hash_offset()`. This configuration is per-DBI, must be done in a **write transaction**, and only while the DBI is **still empty**.
 
 **Example: plain aggregate DBI (hash slice taken from value bytes)**
-This DBI maintains entry counts, distinct-key counts, and a hashsum fingerprint from the defined hash slice.
+This DBI maintains entry counts, distinct-key counts, and a hashsum aggregate from the defined hash slice.
 
 ```c
 unsigned flags =
   MDB_CREATE |
   MDB_AGG_ENTRIES |   /* maintain entry (record) counts */
   MDB_AGG_KEYS    |   /* maintain distinct-key counts */
-  MDB_AGG_HASHSUM;    /* maintain hashsum fingerprint */
+  MDB_AGG_HASHSUM;    /* maintain hashsum aggregate */
 
 MDB_dbi dbi;
 mdb_dbi_open(txn, "plain_agg", flags, &dbi);
 
-`/* hash_offset: 0 = first bytes, -1 = last bytes */`
+/* hash_offset: 0 = first bytes, -1 = last bytes */
 mdb_set_hash_offset(txn, dbi, /*hash_offset = */0);
 ```
 
@@ -191,7 +191,7 @@ The Aggregate API provides **fast summaries over sets of records** (entire DB, a
 ## Result type
 
 ```c
-/* Aggregate result (returned by totals/prefix/range queries) */
+/* Aggregate summary (returned by totals/prefix/range queries) */
 typedef struct MDB_agg {
   unsigned mv_flags;                      // OUT: which aggregate components are valid (MDB_AGG_* bits)
                                           //      set by aggregate functions to match the DBI's schema
@@ -223,7 +223,7 @@ Use this when you want to **detect at runtime** which aggregate components are a
 ### `mdb_agg_totals()`
 
 ```c
-/* Compute aggregates over the entire DBI */
+/* Compute aggregate summary over the entire DBI */
 int mdb_agg_totals(
   MDB_txn  *txn,   // IN: transaction handle
   MDB_dbi   dbi,   // IN: target DBI
@@ -231,14 +231,14 @@ int mdb_agg_totals(
 );
 ```
 
-Returns the **full-database totals** in `*out`—the quickest way to obtain overall entry count / key count / full fingerprint.
+Returns the **full-database aggregate (incl. hashsum)** in `*out`—the quickest way to obtain overall entry count / key count / full hashsum.
 
 
 
 ### Prefix aggregate
 
 The **prefix aggregate** API computes aggregate totals over the *prefix* of the DBI’s ordered records: i.e., **all records that come before a given pivot** in the DB’s total order.
-It returns those totals in `MDB_agg` (entries/keys/hashsum as enabled), letting you get “counts and fingerprint up to here” without scanning.
+It returns those totals in `MDB_agg` (entries/keys/hashsum as enabled), letting you get “counts and hashsums up to here” without scanning.
 
 
 ```c
@@ -405,8 +405,8 @@ For a storage backend, this creates very specific hot-path requirements:
 * **Reuse across subranges**: reconciliation loops tend to query many subranges within the *same* outer bounds, so recomputing “where the window starts/ends” over and over is wasted work.
 
 
-AELMDB’s **cached window APIs** are built specifically for this. 
-They cache the expensive part, mapping a key-range window to an **absolute entry-rank interval**, and then let a program cheaply:
+AELMDB’s **window subrange APIs** are built specifically for this. 
+They cache the **key-bounds → entry-rank mapping**, mapping a key-range window to an **absolute entry-rank interval**, and then let a program cheaply:
 
 1. compute a range **aggregate** (an `MDB_agg` summary, typically using `HASHSUM`) for any **relative entry-rank subrange** inside the window, and
 2. compute a **window-relative lower-bound rank** for a key (and optionally value for `MDB_DUPSORT`) without re-deriving the window mapping each time.
@@ -418,14 +418,14 @@ See also the AELMDB storage in Negentropy for Range-Based Set Reconciliation, na
 
 
 
-## Cached window descriptor
+## Window subrange descriptor
 
 `MDB_agg_window` is the cached “outer range mapping” that makes repeated subrange queries cheap. You initialize it to zero, then reuse it for subsequent queries as long as the bounds/flags stay the same.
 
 ```c
 #define MDB_AGG_WINDOW_END UINT64_MAX // sentinel: rel_end means "use the full window end"
 
-/* Cached mapping from a key-range window to an absolute entry-rank interval */
+/* Mapping from a key-range window to an absolute entry-rank interval */
 typedef struct MDB_agg_window {
   unsigned mv_flags;         // OUT: DBI aggregate schema (MDB_AGG_* bits) cached for this window
   unsigned mv_range_flags;   // OUT: MDB_RANGE_* flags defining inclusion/exclusion of window bounds
@@ -435,17 +435,18 @@ typedef struct MDB_agg_window {
 } MDB_agg_window;
 ```
 
-**Rationale:** reconciliation repeatedly queries many subranges within the same outer bounds; recomputing the outer bounds’ absolute entry-ranks every time wastes work. `MDB_agg_window` caches that mapping`(low_key, high_key, range_flags) → [mv_abs_lo, mv_abs_hi)`, so subsequent aggregates and lower-bound queries can run in **window-relative rank coordinates**.
+**Rationale:** reconciliation repeatedly queries many subranges within the same outer bounds; recomputing the outer bounds’ absolute entry-ranks every time wastes work. 
+`MDB_agg_window` stores that mapping `(low_key, high_key, range_flags) → [mv_abs_lo, mv_abs_hi)`, so subsequent aggregates and lower-bound queries can run in **window-relative rank coordinates**.
 
-**Usage rules:** zero-initialize before first use; reuse only with the same bounds and `range_flags`.
+**Usage rules:** zero-initialize before first use; reuse only with the same bounds and `range_flags` (not checked).
 
 
 
-## Cached window functions 
+## Window subrange functions 
 
 ### `mdb_agg_window_aggregate()`
 
-Computes fingeaggregates for a **relative entry-rank subrange** inside a cached window.
+Computes aggregates for a **relative entry-rank subrange** inside a subrange window.
 If the cache is empty or the bounds changed, it (re)computes the window’s absolute rank interval, then answers subrange queries efficiently.
 
 ```c
@@ -457,7 +458,7 @@ int mdb_agg_window_aggregate(
   const MDB_val  *high_key,    // IN: optional window upper key (NULL => open-ended)
   const MDB_val  *high_data,   // IN: optional window upper value (record-order bound for MDB_DUPSORT)
   unsigned        range_flags, // IN: MDB_RANGE_* controlling inclusion/exclusion of window bounds
-  MDB_agg_window *window,      // IN/OUT: cached window descriptor (must be zeroed initially)
+  MDB_agg_window *window,      // IN/OUT: window subrange descriptor (must be zeroed initially)
   uint64_t        rel_begin,   // IN: relative begin entry-rank within window
   uint64_t        rel_end,     // IN: relative end entry-rank within window (or MDB_AGG_WINDOW_END)
   MDB_agg        *out          // OUT: aggregates over [rel_begin, rel_end) within the window
@@ -470,19 +471,19 @@ The subrange itself is expressed in **relative entry-rank space** within the win
 
 ### `mdb_agg_window_rank()`
 
-Computes the **lower-bound position** of a key (and optional value for `MDB_DUPSORT`) **relative to the cached window**.
+Computes the **lower-bound position** of a key (and optional value for `MDB_DUPSORT`) **relative to the subrange window**.
 This is typically used to place split points and to map protocol “cursor keys” into window-relative ranks during reconciliation.
 
 ```c
 int mdb_agg_window_rank(
   MDB_txn        *txn,         // IN: transaction handle
   MDB_dbi         dbi,         // IN: target DBI
-  const MDB_val  *low_key,     // IN: window lower key (must match cached window)
+  const MDB_val  *low_key,     // IN: window lower key (must match window)
   const MDB_val  *low_data,    // IN: window lower value
   const MDB_val  *high_key,    // IN: window upper key
   const MDB_val  *high_data,   // IN: window upper value
-  unsigned        range_flags, // IN: MDB_RANGE_* (must match cached window)
-  MDB_agg_window *window,      // IN/OUT: cached window descriptor
+  unsigned        range_flags, // IN: MDB_RANGE_* (must match window)
+  MDB_agg_window *window,      // IN/OUT: window subrange descriptor
   const MDB_val  *key,         // IN: query key (lower-bound search)
   const MDB_val  *data,        // IN: optional query value (record-order for MDB_DUPSORT)
   uint64_t       *rel_rank     // OUT: relative rank within window [0, window_size]
@@ -523,7 +524,7 @@ int mdb_dbg_check_agg_db(MDB_txn *txn, MDB_dbi dbi);
 ```
 
 This is intended for unit tests that want to run a full “check aggregates now” pass on demand. 
-This macro also activates sevral (slow) integrity checks.
+This macro also activates several (slow) integrity checks.
 A second macro `MDB_DEBUG_AGG_PRINT` adds important debug prints of the internal steps, again for debug purposes.
 
 
@@ -558,14 +559,14 @@ AELMDB generalizes this idea into a richer, reconciliation-oriented aggregate la
 
 * **Multiple aggregate components**: `MDB_AGG_ENTRIES` (records), `MDB_AGG_KEYS` (distinct keys), `MDB_AGG_HASHSUM` (range aggregate accumulator).
 * **Richer aggregate queries** beyond “count”: prefix and range aggregations returning a full `MDB_agg` summary (counts + aggregate where enabled).
-* **Window-cached helpers** designed for **Range-Based Set Reconciliation** loops, where you repeatedly compute aggregates and lower-bound ranks inside stable outer bounds.
+* **Window subrange helpers** designed for **Range-Based Set Reconciliation** loops, where you repeatedly compute aggregates and lower-bound ranks inside stable outer bounds.
 
 A simple conceptual mapping:
 
 * `MDB_COUNTED` → `MDB_AGG_ENTRIES`
 * `mdb_counted_entries()` → `mdb_agg_totals()` + read `out.mv_agg_entries`
 * `mdb_counted_rank()` / `mdb_counted_select()` → `mdb_agg_rank()` / `mdb_agg_select()` with `MDB_AGG_WEIGHT_ENTRIES`
-* New: `MDB_AGG_KEYS`, `MDB_AGG_HASHSUM`, window-cached anti-entropy helpers (`MDB_agg_window`, `mdb_agg_window_*`).
+* New: `MDB_AGG_KEYS`, `MDB_AGG_HASHSUM`, window subrange anti-entropy helpers (`MDB_agg_window`, `mdb_agg_window_*`).
 
 
 ## Compile-time detection

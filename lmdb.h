@@ -1870,7 +1870,7 @@ int mdb_agg_cursor_seek_rank(MDB_cursor *mc, uint64_t rank,
 	MDB_val *key, MDB_val *data);
 
 
-/** @brief Cached key-range window descriptor for Negentropy-style slice queries.
+/** @brief Window-relative key-range descriptor for Negentropy-style slice queries.
  *
  * This structure caches the mapping from a key range (low/high bounds) to an
  * entry-rank interval [mv_abs_lo, mv_abs_hi) within the DBI's total order.
@@ -1890,10 +1890,10 @@ typedef struct MDB_agg_window {
 /** Sentinel value for rel_end meaning "use the full window end". */
 #define MDB_AGG_WINDOW_END UINT64_MAX
 
-/** @brief Initialize/reuse a cached key-range window and compute an aggregate for a subrange.
+/** @brief Initialize/reuse a key-range window and compute an aggregate for a subrange.
  *
  * This combines:
- *  - computing totals() and the absolute entry ranks for the window [low,high)
+ *  - computing DBI totals and the absolute entry ranks for the window (defined by low and high)
  *  - aggregating a subrange in entry-rank space within that window
  *
  * Window bounds follow #mdb_agg_range() semantics:
@@ -1913,10 +1913,10 @@ int mdb_agg_window_aggregate(MDB_txn *txn, MDB_dbi dbi,
   uint64_t rel_begin, uint64_t rel_end,
   MDB_agg *out);
 
-/** @brief Lower-bound rank within a cached key-range window.
+/** @brief Lower-bound rank within a key-range window.
  *
  * Computes the lower-bound entry-rank of the first record >= (key,data) in the
- * DBI's total order, then clamps it into the cached window interval
+ * DBI's total order, then clamps it into the window range interval
  * [mv_abs_lo, mv_abs_hi). The returned rank is *relative* to the window start
  * and is always in [0, window_size].
  *

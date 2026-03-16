@@ -15762,7 +15762,7 @@ mdb_agg_prefix_kd_internal(MDB_txn *txn, MDB_dbi dbi,
 }
 
 
-/* --- Aggregate window + rank-range fingerprint (Negentropy helper API) --- */
+/* --- Aggregate window + rank-range aggregate (Negentropy helper API) --- */
 
 /* Add a fully-covered subtree aggregate blob to an accumulator, with basic overflow checks. */
 static int
@@ -17015,15 +17015,15 @@ mdb_agg_window_ensure_init2(MDB_txn *txn, MDB_dbi dbi,
 	return MDB_SUCCESS;
 }
 
-/* Compute (and optionally cache) a key-bound window mapping plus a rank-range fingerprint. */
+/* Compute (and optionally cache) a key-bound window mapping plus a rank-range aggregate. */
 int ESECT
-mdb_agg_window_fingerprint(MDB_txn *txn, MDB_dbi dbi,
-						   const MDB_val *low_key, const MDB_val *low_data,
-						   const MDB_val *high_key, const MDB_val *high_data,
-						   unsigned range_flags,
-						   MDB_agg_window *window,
-						   uint64_t rel_begin, uint64_t rel_end,
-						   MDB_agg *out)
+mdb_agg_window_aggregate(MDB_txn *txn, MDB_dbi dbi,
+						 const MDB_val *low_key, const MDB_val *low_data,
+						 const MDB_val *high_key, const MDB_val *high_data,
+						 unsigned range_flags,
+						 MDB_agg_window *window,
+						 uint64_t rel_begin, uint64_t rel_end,
+						 MDB_agg *out)
 {
 	MDB_db *db;
 	uint16_t agg;

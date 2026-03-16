@@ -1876,7 +1876,7 @@ int mdb_agg_cursor_seek_rank(MDB_cursor *mc, uint64_t rank,
  * entry-rank interval [mv_abs_lo, mv_abs_hi) within the DBI's total order.
  *
  * @note Callers must zero-initialize this structure before the first call to
- *       #mdb_agg_window_fingerprint(). Subsequent calls may reuse it as long
+ *       #mdb_agg_window_aggregate(). Subsequent calls may reuse it as long
  *       as the same key bounds and flags are used.
  */
 typedef struct MDB_agg_window {
@@ -1890,7 +1890,7 @@ typedef struct MDB_agg_window {
 /** Sentinel value for rel_end meaning "use the full window end". */
 #define MDB_AGG_WINDOW_END UINT64_MAX
 
-/** @brief Initialize/reuse a cached key-range window and compute a fingerprint for a subrange.
+/** @brief Initialize/reuse a cached key-range window and compute an aggregate for a subrange.
  *
  * This combines:
  *  - computing totals() and the absolute entry ranks for the window [low,high)
@@ -1905,7 +1905,7 @@ typedef struct MDB_agg_window {
  * window: [rel_begin, rel_end). If rel_end is #MDB_AGG_WINDOW_END, it is
  * treated as the end of the window.
  */
-int mdb_agg_window_fingerprint(MDB_txn *txn, MDB_dbi dbi,
+int mdb_agg_window_aggregate(MDB_txn *txn, MDB_dbi dbi,
   const MDB_val *low_key, const MDB_val *low_data,
   const MDB_val *high_key, const MDB_val *high_data,
   unsigned range_flags,
@@ -1926,7 +1926,7 @@ int mdb_agg_window_fingerprint(MDB_txn *txn, MDB_dbi dbi,
  * - If the DB is #MDB_DUPSORT and @p data is provided (and specified), the
  *   query uses record-order (key,data) set-range semantics.
  *
- * Window initialization / reuse follows #mdb_agg_window_fingerprint().
+ * Window initialization / reuse follows #mdb_agg_window_aggregate().
  */
 int mdb_agg_window_rank(MDB_txn *txn, MDB_dbi dbi,
   const MDB_val *low_key, const MDB_val *low_data,

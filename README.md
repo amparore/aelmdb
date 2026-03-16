@@ -4,8 +4,8 @@
 
 This enables:
 - **Order-statistics** on the database order (fast `rank` / `select`), extending the [order statistics-B-tree](https://en.wikipedia.org/wiki/Order_statistic_tree) design used in **[DLMDB](https://github.com/datalevin/dlmdb)**
-- **Fast range summaries** (counts + fixed-size **hashsum fingerprints**) that are composable and efficient for large datasets
-- **Anti-entropy / reconciliation-friendly primitives**, specifically targeting **Range-Based Set Reconciliation ([RBSR](https://logperiodic.com/rbsr.html))**, where you repeatedly compare and split ordered ranges using compact fingerprints
+- **Fast range summaries** (counts + fixed-size **hash sums**) that are composable and efficient for large datasets
+- **Anti-entropy / reconciliation-friendly primitives**, specifically targeting **Range-Based Set Reconciliation ([RBSR](https://logperiodic.com/rbsr.html))**, where you repeatedly compare and split ordered ranges using compact aggregates
 
 
 
@@ -15,7 +15,7 @@ This enables:
 
 LMDB is a **low-level, embedded key–value database** built around a memory-mapped B+tree: it stores **sorted `(key, value)` pairs** and provides very fast point lookups and ordered iteration.
 Keys and values are treated as **opaque byte strings** (`MDB_val`: pointer + length). <br/>
-AELMDB keeps that model, but adds an optional *interpretation layer* for **anti-entropy hash fingerprints**:
+AELMDB keeps that model, but adds an optional *interpretation layer* for **anti-entropy hash aggregates**:
 
 * a record is still just a `(key,value)` tuple of raw bytes
 * but *if you opt in* (via DBI flags), AELMDB assumes that **within each record there exists a fixed-size “hash slice”**:
@@ -24,9 +24,9 @@ AELMDB keeps that model, but adds an optional *interpretation layer* for **anti-
   * at a configurable **signed byte offset** (hash_offset): >=0 from start, <0 from end (-1 = last bytes)
   * with a fixed width of `MDB_HASH_SIZE` bytes
 
-When enabled, AELMDB maintains a **hashsum aggregate** by summing (with wraparound arithmetic) that `MDB_HASH_SIZE`-byte slice for every record in a subtree. This makes it possible to compute **range fingerprints** efficiently (a building block for anti-entropy / reconciliation), without scanning all records in the range.
+When enabled, AELMDB maintains a **hashsum aggregate** by summing (with wraparound arithmetic) that `MDB_HASH_SIZE`-byte slice for every record in a subtree. This makes it possible to compute **range aggregates** efficiently (a building block for anti-entropy / reconciliation), without scanning all records in the range.
 
-In the same mechanism, AELMDB can also maintain **count aggregates** (entries and/or distinct keys), enabling efficient order-statistics queries (rank/select) and fast range counts.
+In the same mechanism, AELMDB can also maintain **counts** (entries and/or distinct keys), enabling efficient order-statistics queries (rank/select) and fast range counts.
 
 ### New DBI flags (aggregate schema)
 
@@ -87,7 +87,7 @@ These counters diverge only with `MDB_DUPSORT`, where one key can contribute man
 ---
 ### Opening DBIs with aggregate flags
 
-When you open (or create) a DBI, you choose an **aggregate schema** by OR-ing `MDB_AGG_*` flags into `mdb_dbi_open()`. That schema determines which per-subtree aggregates are maintained in branch pages and therefore which queries are available later (range summaries, rank/select, fingerprints).
+When you open (or create) a DBI, you choose an **aggregate schema** by OR-ing `MDB_AGG_*` flags into `mdb_dbi_open()`. That schema determines which per-subtree aggregates are maintained in branch pages and therefore which queries are available later (range summaries, rank/select).
 
 If you enable `MDB_AGG_HASHSUM`, you must also configure **where the hash slice lives** inside the chosen hash source (value by default, or key in key-hash mode) using `mdb_set_hash_offset()`. This configuration is per-DBI, must be done in a **write transaction**, and only while the DBI is **still empty**.
 
@@ -125,7 +125,7 @@ mdb_set_hash_offset(txn, dbi, 0);
 ```
 
 **Example: key-based hashsum (hash slice taken from key bytes)**
-This mode is useful when your key embeds a stable fixed-size identifier (e.g., `[timestamp | 32-byte-id]`) and you want fingerprints derived from keys rather than values. 
+This mode is useful when your key embeds a stable fixed-size identifier (e.g., `[timestamp | 32-byte-id]`) and you want the hash slice derived from keys rather than values. 
 In this configuration the hash slice is `key[hash_offset .. hash_offset + MDB_HASH_SIZE)`.
 
 ```c
@@ -218,7 +218,7 @@ int mdb_agg_info(
 );
 ```
 
-Use this when you want to **detect at runtime** which aggregate components are available (e.g., to decide whether you can run rank/select or hashsum-based fingerprints).
+Use this when you want to **detect at runtime** which aggregate components are available (e.g., to decide whether you can run rank/select on that DBI).
 
 ### `mdb_agg_totals()`
 
@@ -266,7 +266,7 @@ int mdb_agg_prefix(
 
 ### Range aggregate
 
-The range aggregate computes aggregates over all records **between two bounds**, with explicit control over **whether each bound is included or excluded**. This is the core primitive for range fingerprints.
+The range aggregate computes aggregates over all records **between two bounds**, with explicit control over **whether each bound is included or excluded**. This is the core primitive for range aggregates.
 
 ```c
 int mdb_agg_range(
@@ -396,11 +396,11 @@ int mdb_agg_cursor_seek_rank(
 
 # 4) Advanced helpers (Negentropy-style windows)
 
-**Set Reconciliation** protocols keep two replicas in sync by *exchanging compact summaries* of what each side has, then drilling down only where those summaries disagree. **Range-Based Set Reconciliation (RBSR)** does this over a *totally ordered set*: peers compute a **fingerprint of a range**, compare it, and if it mismatches they **split the range into subranges** and repeat recursively until the differing parts are small enough to enumerate explicitly. (see [arXiv - Range-Based Set Reconciliation](https://arxiv.org/abs/2212.13567))
+**Set Reconciliation** protocols keep two replicas in sync by *exchanging compact summaries* of what each side has, then drilling down only where those summaries disagree. **Range-Based Set Reconciliation (RBSR)** does this over a *totally ordered set*: peers compute an **aggregate of a sub-range**, compare it, and if it mismatches they **split the range into subranges** and repeat recursively until the differing parts are small enough to enumerate explicitly. (see [arXiv - Range-Based Set Reconciliation](https://arxiv.org/abs/2212.13567))
 
 For a storage backend, this creates very specific hot-path requirements:
 
-* **Fast range fingerprints**: repeatedly compute fingerprints for many **overlapping subranges** (often created by successive splits), without scanning all records in each subrange. (see [Range-Based Set Reconciliation](https://aljoscha-meyer.de/assets/landing/rbsr.pdf))
+* **Fast range aggregates**: repeatedly compute aggregates for many **overlapping subranges** (often created by successive splits), without scanning all records in each subrange. (see [Range-Based Set Reconciliation](https://aljoscha-meyer.de/assets/landing/rbsr.pdf))
 * **Fast split/navigation**: given a range, quickly find “midpoints” (often by entry rank) and quickly map a queried key to a **lower-bound position** inside that same range.
 * **Reuse across subranges**: reconciliation loops tend to query many subranges within the *same* outer bounds, so recomputing “where the window starts/ends” over and over is wasted work.
 
@@ -408,11 +408,11 @@ For a storage backend, this creates very specific hot-path requirements:
 AELMDB’s **cached window APIs** are built specifically for this. 
 They cache the expensive part, mapping a key-range window to an **absolute entry-rank interval**, and then let a program cheaply:
 
-1. compute a range **fingerprint** (an `MDB_agg` summary, typically using `HASHSUM`) for any **relative entry-rank subrange** inside the window, and
+1. compute a range **aggregate** (an `MDB_agg` summary, typically using `HASHSUM`) for any **relative entry-rank subrange** inside the window, and
 2. compute a **window-relative lower-bound rank** for a key (and optionally value for `MDB_DUPSORT`) without re-deriving the window mapping each time.
 
 
-This is the exact pattern used by Negentropy-style reconciliation loops: many fingerprint calls + many lower-bound calls, all within stable outer bounds. (see [negentropy](https://github.com/hoytech/negentropy))
+This is the exact pattern used by Negentropy-style reconciliation loops: many aggregate calls + many lower-bound calls, all within stable outer bounds. (see [negentropy](https://github.com/hoytech/negentropy))
 
 See also the AELMDB storage in Negentropy for Range-Based Set Reconciliation, named [AELMDBSlice](https://github.com/amparore/negentropy-aelmdb), and the extended C++ wrapper [lmdbxx](https://github.com/amparore/lmdbxx-aelmdb).
 
@@ -435,7 +435,7 @@ typedef struct MDB_agg_window {
 } MDB_agg_window;
 ```
 
-**Rationale:** reconciliation repeatedly queries many subranges within the same outer bounds; recomputing the outer bounds’ absolute entry-ranks every time wastes work. `MDB_agg_window` caches that mapping`(low_key, high_key, range_flags) → [mv_abs_lo, mv_abs_hi)`, so subsequent fingerprint and lower-bound queries can run in **window-relative rank coordinates**.
+**Rationale:** reconciliation repeatedly queries many subranges within the same outer bounds; recomputing the outer bounds’ absolute entry-ranks every time wastes work. `MDB_agg_window` caches that mapping`(low_key, high_key, range_flags) → [mv_abs_lo, mv_abs_hi)`, so subsequent aggregates and lower-bound queries can run in **window-relative rank coordinates**.
 
 **Usage rules:** zero-initialize before first use; reuse only with the same bounds and `range_flags`.
 
@@ -443,13 +443,13 @@ typedef struct MDB_agg_window {
 
 ## Cached window functions 
 
-### `mdb_agg_window_fingerprint()`
+### `mdb_agg_window_aggregate()`
 
-Computes fingerprints for a **relative entry-rank subrange** inside a cached window.
+Computes fingeaggregates for a **relative entry-rank subrange** inside a cached window.
 If the cache is empty or the bounds changed, it (re)computes the window’s absolute rank interval, then answers subrange queries efficiently.
 
 ```c
-int mdb_agg_window_fingerprint(
+int mdb_agg_window_aggregate(
   MDB_txn        *txn,         // IN: transaction handle
   MDB_dbi         dbi,         // IN: target DBI
   const MDB_val  *low_key,     // IN: optional window lower key (NULL => open-ended)
@@ -556,9 +556,9 @@ DLMDB-style *counted B-tree* functionality (as reflected in the original header 
 
 AELMDB generalizes this idea into a richer, reconciliation-oriented aggregate layer:
 
-* **Multiple aggregate components**: `MDB_AGG_ENTRIES` (records), `MDB_AGG_KEYS` (distinct keys), `MDB_AGG_HASHSUM` (range fingerprint accumulator).
-* **Richer aggregate queries** beyond “count”: prefix and range aggregations returning a full `MDB_agg` summary (counts + fingerprint where enabled).
-* **Window-cached helpers** designed for **Range-Based Set Reconciliation** loops, where you repeatedly compute fingerprints and lower-bound ranks inside stable outer bounds.
+* **Multiple aggregate components**: `MDB_AGG_ENTRIES` (records), `MDB_AGG_KEYS` (distinct keys), `MDB_AGG_HASHSUM` (range aggregate accumulator).
+* **Richer aggregate queries** beyond “count”: prefix and range aggregations returning a full `MDB_agg` summary (counts + aggregate where enabled).
+* **Window-cached helpers** designed for **Range-Based Set Reconciliation** loops, where you repeatedly compute aggregates and lower-bound ranks inside stable outer bounds.
 
 A simple conceptual mapping:
 

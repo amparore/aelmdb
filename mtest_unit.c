@@ -4811,22 +4811,22 @@ static void test_api_window_rank_seek(void)
             }
 
             MDB_agg got;
-            CHECK(mdb_agg_window_fingerprint(txn, dbi,
-                                             &low, NULL,
-                                             &high, NULL,
-                                             rf,
-                                             &w,
-                                             rel_begin, rel_end,
-                                             &got),
-                  "window_fingerprint");
+            CHECK(mdb_agg_window_aggregate(txn, dbi,
+                                           &low, NULL,
+                                           &high, NULL,
+                                           rf,
+                                           &w,
+                                           rel_begin, rel_end,
+                                           &got),
+                  "window_aggregate");
 
-            REQUIRE((size_t)w.mv_abs_lo == exp_lo, "window_fingerprint: abs_lo mismatch");
-            REQUIRE((size_t)w.mv_abs_hi == exp_hi, "window_fingerprint: abs_hi mismatch");
-            REQUIRE((size_t)w.mv_total_entries == vv.len, "window_fingerprint: total_entries mismatch");
+            REQUIRE((size_t)w.mv_abs_lo == exp_lo, "window_aggregate: abs_lo mismatch");
+            REQUIRE((size_t)w.mv_abs_hi == exp_hi, "window_aggregate: abs_hi mismatch");
+            REQUIRE((size_t)w.mv_total_entries == vv.len, "window_aggregate: total_entries mismatch");
 
             MDB_agg exp;
             oracle_rank_range_agg(&vv, exp_lo + (size_t)rel_begin, exp_lo + (size_t)rel_end, &exp);
-            agg_require_equal(exp.mv_flags, &got, &exp, "window_fingerprint: rank-range agg mismatch");
+            agg_require_equal(exp.mv_flags, &got, &exp, "window_aggregate: rank-range agg mismatch");
 
             /* Step 2: window_rank(rel) must match oracle lower-bound within window (key-only). */
             {

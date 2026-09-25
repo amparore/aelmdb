@@ -1,0 +1,7 @@
+variant	rep	output
+current	1	totals=0.001656 prefix=0.141729 range=0.282196 rank=0.054055 select=0.036901 cursor_seek=0.035085 window_agg=0.201152 window_rank=0.026661 checksum=51705184745
+legacy	1	totals=0.002539 prefix=0.161458 range=0.307833 rank=0.097276 select=0.051640 cursor_seek=0.054638 window_agg=0.219806 window_rank=0.037976 checksum=51705184745
+current	2	totals=0.001453 prefix=0.145904 range=0.264398 rank=0.050820 select=0.033496 cursor_seek=0.033696 window_agg=0.187842 window_rank=0.025529 checksum=51705184745
+legacy	2	totals=0.002093 prefix=0.153271 range=0.289422 rank=0.070599 select=0.048846 cursor_seek=0.042503 window_agg=0.210675 window_rank=0.034202 checksum=51705184745
+current	3	totals=0.001654 prefix=0.132606 range=0.283268 rank=0.052295 select=0.035607 cursor_seek=0.034705 window_agg=0.201367 window_rank=0.028498 checksum=51705184745
+legacy	3	totals=0.002008 prefix=0.160921 range=0.305945 rank=0.076418 select=0.046769 cursor_seek=0.046161 window_agg=0.217500 window_rank=0.035389 checksum=51705184745

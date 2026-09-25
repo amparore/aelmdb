@@ -1,0 +1,6 @@
+implementation	test	MDB_HASH_SIZE	status	result
+aelmdb-baseline	c3-minimal	32	EXPECTED_FAIL	MDB_GET_BOTH missing duplicate returned next greater duplicate
+aelmdb-c3	c3-minimal	32	PASS	MDB_NOTFOUND
+aggmaint	c3-minimal	32	PASS	MDB_NOTFOUND
+aelmdb-c3	long-80x400	32	PASS	585f21a81eda71b8
+aggmaint	long-80x400	32	PASS	585f21a81eda71b8

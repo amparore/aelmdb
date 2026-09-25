@@ -1,0 +1,4 @@
+impl	mode	hash	status	signature_or_failure
+aelmdb	long	32	FAIL(3)	FAIL[aelmdb/long-r0-op194-dup-a67-k58-d64]: DUPSORT exact delete result matches pre-state
+aggmaint	long	32	PASS	585f21a81eda71b8
+aggmaint-v1	long	32	PASS	585f21a81eda71b8

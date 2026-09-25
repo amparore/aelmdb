@@ -1,0 +1,7 @@
+impl	mode	hash	status	signature_or_failure
+aelmdb	large-key-near-max	32	PASS	ee0eeb68304b5b99
+aggmaint	large-key-near-max	32	PASS	ee0eeb68304b5b99
+aggmaint-v1	large-key-near-max	32	PASS	ee0eeb68304b5b99
+aelmdb	large-key-half-to-near-max	32	FAIL(2)	FAIL[aelmdb/large-plain-r1-del-k1371]: large plain delete: -30796 MDB_CORRUPTED: Located page was wrong type
+aggmaint	large-key-half-to-near-max	32	PASS	d71020bb9bfe4787
+aggmaint-v1	large-key-half-to-near-max	32	PASS	d71020bb9bfe4787

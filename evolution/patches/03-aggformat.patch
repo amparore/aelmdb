@@ -1,0 +1,1576 @@
+diff --git a/lmdb.h b/lmdb.h
+index 41db62b..c088463 100644
+--- a/lmdb.h
++++ b/lmdb.h
+@@ -231,6 +231,9 @@ typedef int mdb_filehandle_t;
+ /** Library patch version */
+ #define MDB_VERSION_PATCH	70
+ 
++/** Aggregate-format intermediate version marker. */
++#define MDB_AGGFORMAT_VERSION  0x0100
++
+ /** Combine args a,b,c into a single integer for easy version comparisons */
+ #define MDB_VERINT(a,b,c)	(((a) << 24) | ((b) << 16) | (c))
+ 
+@@ -353,6 +356,25 @@ typedef void (MDB_rel_func)(MDB_val *item, void *oldptr, void *newptr, void *rel
+ #define MDB_INTEGERDUP	0x20
+ 	/** with #MDB_DUPSORT, use reverse string dups */
+ #define MDB_REVERSEDUP	0x40
++
++	/** Aggregate branch-node layout flags.
++	 *
++	 * These bits select which aggregate fields are reserved in every branch
++	 * node of the database.  This intermediate layer defines only the on-disk
++	 * representation; aggregate values themselves are not maintained yet.
++	 */
++#ifndef MDB_HASH_SIZE
++#define MDB_HASH_SIZE 32
++#endif
++#if (MDB_HASH_SIZE < 1) || (MDB_HASH_SIZE > 256)
++#error "MDB_HASH_SIZE must be in [1..256]"
++#endif
++#define MDB_AGG_ENTRIES	0x80
++#define MDB_AGG_KEYS		0x100
++#define MDB_AGG_HASHSUM	0x200
++#define MDB_AGG_HASHSOURCE_FROM_KEY	0x400
++#define MDB_AGG_MASK	(MDB_AGG_ENTRIES|MDB_AGG_KEYS|MDB_AGG_HASHSUM)
++
+ 	/** create DB if not already existing */
+ #define MDB_CREATE		0x40000
+ /** @} */
+@@ -1650,6 +1672,24 @@ int	mdb_reader_list(MDB_env *env, MDB_msg_func *func, void *ctx);
+ int	mdb_reader_check(MDB_env *env, int *dead);
+ /**	@} */
+ 
++/** @brief Retrieve the aggregate-layout schema flags for a DBI.
++ *
++ * This reports the persistent layout flags only.  In the aggformat
++ * intermediate layer the reserved branch-node values are intentionally
++ * unspecified.
++ */
++int mdb_agg_info(MDB_txn *txn, MDB_dbi dbi, unsigned *agg_flags);
++
++/** @brief Set the persistent hash-slice offset for an empty HASHSUM DBI.
++ *
++ * The offset is part of the database schema.  Aggregate values are not
++ * maintained by the aggformat intermediate layer.
++ */
++int mdb_set_hash_offset(MDB_txn *txn, MDB_dbi dbi, int hash_offset);
++
++/** @brief Get the persistent hash-slice offset for a HASHSUM DBI. */
++int mdb_get_hash_offset(MDB_txn *txn, MDB_dbi dbi, int *hash_offset);
++
+ #ifdef __cplusplus
+ }
+ #endif
+@@ -1661,4 +1701,4 @@ int	mdb_reader_check(MDB_env *env, int *dead);
+ 	\li \ref mdb_stat_1
+ */
+ 
+-#endif /* _LMDB_H_ */
++#endif /* _LMDB_H_ */
+\ No newline at end of file
+diff --git a/mdb.c b/mdb.c
+index 5f57704..831ced0 100644
+--- a/mdb.c
++++ b/mdb.c
+@@ -252,6 +252,17 @@ union semun {
+ #endif
+ 
+ #include "lmdb.h"
++
++#ifndef MDB_AGGFORMAT_VERSION
++#error "Wrong LMDB headers detected. Expected aggformat_lmdb.h."
++#endif
++#if !defined(MDB_HASH_SIZE)
++#error "MDB_HASH_SIZE must be defined by lmdb.h"
++#endif
++#if (MDB_HASH_SIZE < 1) || (MDB_HASH_SIZE > 256)
++#error "MDB_HASH_SIZE must be in [1..256]"
++#endif
++
+ #include "midl.h"
+ 
+ #if (BYTE_ORDER == LITTLE_ENDIAN) == (BYTE_ORDER == BIG_ENDIAN)
+@@ -665,7 +676,12 @@ static txnid_t mdb_debug_start;
+ #define MDB_MAGIC	 0xBEEFC0DE
+ 
+ 	/**	The version number for a database's datafile format. */
+-#define MDB_DATA_VERSION	 ((MDB_DEVEL) ? 999 : 1)
++/* Aggregate-format file version. The low 16 bits bind the compile-time
++ * MDB_HASH_SIZE because it participates in the persistent branch-node layout.
++ */
++#define MDB_DATA_VERSION_TAG 0xA335u
++#define MDB_DATA_VERSION \
++	((MDB_DATA_VERSION_TAG << 16) | ((unsigned)(MDB_HASH_SIZE) & 0xffffu))
+ 	/**	The version number for a database's lockfile format. */
+ #define MDB_LOCK_VERSION	 ((MDB_DEVEL) ? 999 : 2)
+ 	/** Number of bits representing #MDB_LOCK_VERSION in #MDB_LOCK_FORMAT.
+@@ -1026,6 +1042,10 @@ typedef struct MDB_page {
+ #define	P_DIRTY		 0x10		/**< dirty page, also set for #P_SUBP pages */
+ #define	P_LEAF2		 0x20		/**< for #MDB_DUPFIXED records */
+ #define	P_SUBP		 0x40		/**< for #MDB_DUPSORT sub-pages */
++#define	P_AGG_ENTRIES	 MDB_AGG_ENTRIES	/**< aggregate layout: entries */
++#define	P_AGG_KEYS	 MDB_AGG_KEYS		/**< aggregate layout: keys */
++#define	P_AGG_HASHSUM	 MDB_AGG_HASHSUM	/**< aggregate layout: hashsum */
++#define	P_AGG_MASK	 MDB_AGG_MASK
+ #define	P_LOOSE		 0x4000		/**< page was dirtied then freed, can be reused */
+ #define	P_KEEP		 0x8000		/**< leave this page alone during spill */
+ /** @} */
+@@ -1112,6 +1132,11 @@ mdb_page_pgno_set(MDB_page *mp, pgno_t pgno)
+ #define IS_LEAF2(p)	 F_ISSET(MP_FLAGS(p), P_LEAF2)
+ 	/** Test if a page is a branch page */
+ #define IS_BRANCH(p)	 F_ISSET(MP_FLAGS(p), P_BRANCH)
++	/** Aggregate schema bits stored in DB/page flags. */
++#define PAGE_AGGFLAGS(p) ((uint16_t)(MP_FLAGS(p) & P_AGG_MASK))
++#define DB_AGGFLAGS(db) ((uint16_t)((db)->md_flags & MDB_AGG_MASK))
++#define MDB_AGG_SCHEMA_MASK (MDB_AGG_MASK|MDB_AGG_HASHSOURCE_FROM_KEY)
++#define DB_AGGSCHEMAFLAGS(db) ((uint16_t)((db)->md_flags & MDB_AGG_SCHEMA_MASK))
+ 	/** Test if a page is an overflow page */
+ #define IS_OVERFLOW(p)	 F_ISSET(MP_FLAGS(p), P_OVERFLOW)
+ 	/** Test if a page is a sub page */
+@@ -1185,10 +1210,71 @@ typedef struct MDB_node {
+ 	/** Address of node \b i in page \b p */
+ #define NODEPTR(p, i)	 ((MDB_node *)((char *)(p) + MP_PTRS(p)[i] + PAGEBASE))
+ 
+-	/** Address of the key for the node */
+-#define NODEKEY(node)	 (void *)((node)->mn_data)
++/* Aggregate branch-node prefix layout.  Component bytes are packed in schema
++ * order, then the entire prefix is padded to EVEN() so the following key starts
++ * at the same 2-byte alignment used throughout LMDB.  Accesses to u64 fields
++ * use memcpy and therefore do not assume stronger alignment of MDB_node. */
++#define MDB_AGG_U64_SIZE ((size_t)sizeof(uint64_t))
++/* Semantic aggregate bytes and physical prefix bytes are deliberately distinct:
++ * the semantic blob is packed, while the branch-node prefix is EVEN-padded so
++ * the following key keeps LMDB's 2-byte alignment invariant. */
++#define MDB_AGG_MAXSZ (MDB_AGG_U64_SIZE + MDB_AGG_U64_SIZE + MDB_HASH_SIZE)
++typedef struct MDB_aggblob {
++	uint8_t v[MDB_AGG_MAXSZ];
++} MDB_aggblob;
++
++static inline size_t
++mdb_agg_value_size_flags(uint16_t agg)
++{
++	size_t n = 0;
++	if (agg & MDB_AGG_ENTRIES) n += MDB_AGG_U64_SIZE;
++	if (agg & MDB_AGG_KEYS) n += MDB_AGG_U64_SIZE;
++	if (agg & MDB_AGG_HASHSUM) n += MDB_HASH_SIZE;
++	return n;
++}
+ 
+-	/** Address of the data for a node */
++static inline size_t
++mdb_agg_prefix_len_flags(uint16_t agg)
++{
++	return EVEN(mdb_agg_value_size_flags(agg));
++}
++
++static inline size_t
++mdb_agg_prefix_bytes(const MDB_page *mp)
++{
++	return (mp && IS_BRANCH(mp)) ?
++		mdb_agg_prefix_len_flags(PAGE_AGGFLAGS(mp)) : 0;
++}
++
++static inline void
++mdb_node_get_agg_blob(const MDB_page *mp, const MDB_node *node, MDB_aggblob *out)
++{
++	uint16_t agg = PAGE_AGGFLAGS(mp);
++	size_t raw = mdb_agg_value_size_flags(agg);
++	if (raw) memcpy(out->v, node->mn_data, raw);
++}
++
++static inline void
++mdb_node_set_agg_blob(MDB_page *mp, MDB_node *node, const MDB_aggblob *in)
++{
++	uint16_t agg = PAGE_AGGFLAGS(mp);
++	size_t raw = mdb_agg_value_size_flags(agg);
++	size_t pfx = mdb_agg_prefix_len_flags(agg);
++	if (raw) memcpy(node->mn_data, in->v, raw);
++	if (pfx > raw) memset(node->mn_data + raw, 0, pfx - raw);
++}
++
++static inline void *
++mdb_nodekey(const MDB_page *mp, const MDB_node *node)
++{
++	return (void *)((char *)node->mn_data + mdb_agg_prefix_bytes(mp));
++}
++
++	/** Address of the key for the node. */
++#define NODEKEY(mp, node) mdb_nodekey((mp), (node))
++
++	/** Address of the data for a leaf node. Aggregate prefixes exist only on
++	 * branch pages, so leaf data retains the ordinary LMDB EVEN(keysize) rule. */
+ #define NODEDATA(node)	 (void *)((char *)(node)->mn_data + EVEN((node)->mn_ksize))
+ 
+ 	/** Get the page number pointed to by a branch node */
+@@ -1208,18 +1294,34 @@ typedef struct MDB_node {
+ 	/** The size of a key in a node */
+ #define NODEKSZ(node)	 ((node)->mn_ksize)
+ 
+-	/** The address of a key in a LEAF2 page.
+-	 *	LEAF2 pages are used for #MDB_DUPFIXED sorted-duplicate sub-DBs.
+-	 *	There are no node headers, keys are stored contiguously.
+-	 */
++	/** The address of a key in a LEAF2 page. */
+ #define LEAF2KEY(p, i, ks)	((char *)(p) + PAGEHDRSZ + ((i)*(ks)))
+ 
+-	/** Set the \b node's key into \b keyptr, if requested. */
+-#define MDB_GET_KEY(node, keyptr)	{ if ((keyptr) != NULL) { \
+-	(keyptr)->mv_size = NODEKSZ(node); (keyptr)->mv_data = NODEKEY(node); } }
++	/** Set the node's key into keyptr, if requested. */
++#define MDB_GET_KEY(mp, node, keyptr)	{ if ((keyptr) != NULL) { \
++	(keyptr)->mv_size = NODEKSZ(node); (keyptr)->mv_data = NODEKEY(mp, node); } }
++
++	/** Set the node's key into key. */
++#define MDB_GET_KEY2(mp, node, key)	{ key.mv_size = NODEKSZ(node); key.mv_data = NODEKEY(mp, node); }
+ 
+-	/** Set the \b node's key into \b key. */
+-#define MDB_GET_KEY2(node, key)	{ key.mv_size = NODEKSZ(node); key.mv_data = NODEKEY(node); }
++/** Stored node bytes, excluding its mp_ptrs[] slot. */
++static inline size_t
++mdb_node_datasize(const MDB_page *mp, const MDB_node *node)
++{
++	size_t sz = NODESIZE + mdb_agg_prefix_bytes(mp) + EVEN(node->mn_ksize);
++	if (IS_LEAF(mp)) {
++		if (F_ISSET(node->mn_flags, F_BIGDATA)) sz += sizeof(pgno_t);
++		else sz += NODEDSZ(node);
++	}
++	return EVEN(sz);
++}
++
++/** Total node footprint including its index slot. */
++static inline size_t
++mdb_node_footprint(const MDB_page *mp, const MDB_node *node)
++{
++	return mdb_node_datasize(mp, node) + sizeof(indx_t);
++}
+ 
+ 	/** Information about a single database in the environment. */
+ typedef struct MDB_db {
+@@ -1229,7 +1331,12 @@ typedef struct MDB_db {
+ 	pgno_t		md_branch_pages;	/**< number of internal pages */
+ 	pgno_t		md_leaf_pages;		/**< number of leaf pages */
+ 	pgno_t		md_overflow_pages;	/**< number of overflow pages */
+-	mdb_size_t	md_entries;		/**< number of data items */
++	mdb_size_t	md_entries;		/**< number of logical records */
++	/* Aggregate-format fields are reserved persistently here.  The aggformat
++	 * layer does not maintain their values. */
++	mdb_size_t	md_keys;
++	int16_t		md_hash_offset;
++	uint8_t		md_hashsum[MDB_HASH_SIZE];
+ 	pgno_t		md_root;		/**< the root page of this tree */
+ } MDB_db;
+ 
+@@ -1237,7 +1344,7 @@ typedef struct MDB_db {
+ #define PERSISTENT_FLAGS	(0xffff & ~(MDB_VALID))
+ 	/** #mdb_dbi_open() flags */
+ #define VALID_FLAGS	(MDB_REVERSEKEY|MDB_DUPSORT|MDB_INTEGERKEY|MDB_DUPFIXED|\
+-	MDB_INTEGERDUP|MDB_REVERSEDUP|MDB_CREATE)
++	MDB_INTEGERDUP|MDB_REVERSEDUP|MDB_AGG_MASK|MDB_AGG_HASHSOURCE_FROM_KEY|MDB_CREATE)
+ 
+ 	/** Handle for the DB used to track free pages. */
+ #define	FREE_DBI	0
+@@ -1492,6 +1599,24 @@ struct MDB_cursor {
+ #endif
+ };
+ 
++/* Aggregate page bits describe branch-node layout only.  Leaf, LEAF2,
++ * subpage, and overflow pages do not contain aggregate prefixes and therefore
++ * carry no page-level aggregate bits. Check branch pages before NODEKEY(). */
++static inline int
++mdb_page_check_agg_schema(MDB_cursor *mc, const MDB_page *mp)
++{
++	uint16_t want;
++
++	if (!mc || !mc->mc_db || !mp || IS_OVERFLOW(mp))
++		return MDB_SUCCESS;
++	want = IS_BRANCH(mp) ? DB_AGGFLAGS(mc->mc_db) : 0;
++	if (PAGE_AGGFLAGS(mp) != want) {
++		mdb_txn_mark_error(mc->mc_txn, MDB_CORRUPTED);
++		return MDB_CORRUPTED;
++	}
++	return MDB_SUCCESS;
++}
++
+ 	/** Context for sorted-dup records.
+ 	 *	We could have gone to a fully recursive design, with arbitrarily
+ 	 *	deep nesting of sub-databases. But for now we only handle these
+@@ -1718,7 +1843,7 @@ typedef struct MDB_split_result {
+ static void mdb_split_result_destroy(MDB_split_result *split);
+ static int mdb_page_split_local(MDB_cursor *mc, MDB_val *newkey,
+ 	MDB_val *newdata, pgno_t newpgno, unsigned int nflags,
+-	MDB_split_result *split);
++	const MDB_aggblob *newagg, MDB_split_result *split);
+ static int mdb_split_publish(MDB_cursor *mc, const MDB_split_result *split,
+ 	unsigned int nflags);
+ static int	mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata,
+@@ -1734,7 +1859,8 @@ static void mdb_env_close0(MDB_env *env, int excl);
+ 
+ static MDB_node *mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp);
+ static int  mdb_node_add(MDB_cursor *mc, indx_t indx,
+-			    MDB_val *key, MDB_val *data, pgno_t pgno, unsigned int flags);
++			    MDB_val *key, MDB_val *data, pgno_t pgno, unsigned int flags,
++			    const MDB_aggblob *branch_agg);
+ static void mdb_node_del(MDB_cursor *mc, int ksize);
+ static void mdb_node_shrink(MDB_page *mp, indx_t indx);
+ typedef struct MDB_move_result {
+@@ -1750,7 +1876,7 @@ static int	mdb_rebalance_apply_move(MDB_cursor *csrc, MDB_cursor *cdst,
+ 	const MDB_move_result *move);
+ static int  mdb_node_read(MDB_cursor *mc, MDB_node *leaf, MDB_val *data);
+ static size_t	mdb_leaf_size(MDB_env *env, MDB_val *key, MDB_val *data);
+-static size_t	mdb_branch_size(MDB_env *env, MDB_val *key);
++static size_t	mdb_branch_size(MDB_env *env, MDB_page *mp, MDB_val *key);
+ 
+ static int	mdb_rebalance(MDB_cursor *mc);
+ static int	mdb_rekey(MDB_cursor *mc, MDB_val *key, int climb);
+@@ -1776,12 +1902,13 @@ static int	mdb_cursor_last(MDB_cursor *mc, MDB_val *key, MDB_val *data);
+ 
+ static void	mdb_cursor_init(MDB_cursor *mc, MDB_txn *txn, MDB_dbi dbi, MDB_xcursor *mx);
+ static void	mdb_xcursor_init0(MDB_cursor *mc);
+-static void	mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node);
++static int	mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node);
+ static void	mdb_xcursor_init_container(MDB_cursor *mc, MDB_page *fp, const void *db);
+ static void	mdb_xcursor_init2(MDB_cursor *mc, MDB_xcursor *src_mx, int force);
+ 
+ static int	mdb_drop0(MDB_cursor *mc, int subs);
+ static void mdb_default_cmp(MDB_txn *txn, MDB_dbi dbi);
++static int mdb_dbi_refresh_stale_snapshot(MDB_txn *txn, MDB_dbi dbi);
+ static int mdb_reader_check0(MDB_env *env, int rlocked, int *dead);
+ 
+ /** @cond */
+@@ -1884,7 +2011,7 @@ mdb_strerror(int err)
+ 		;
+ 	}
+ 	buf[0] = 0;
+-	FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM |
++FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM |
+ 		FORMAT_MESSAGE_IGNORE_INSERTS,
+ 		NULL, err, 0, ptr, MSGSIZE, NULL);
+ 	return ptr;
+@@ -2023,17 +2150,13 @@ mdb_page_list(MDB_page *mp)
+ 		}
+ 		node = NODEPTR(mp, i);
+ 		key.mv_size = node->mn_ksize;
+-		key.mv_data = node->mn_data;
+-		nsize = NODESIZE + EVEN(key.mv_size);
++		key.mv_data = NODEKEY(mp, node);
++		nsize = (unsigned int)mdb_node_datasize(mp, node);
+ 		if (IS_BRANCH(mp)) {
+ 			fprintf(stderr, "key %d: page %"Yu", %s\n", i, NODEPGNO(node),
+ 				DKEY(&key));
+ 			total += nsize;
+ 		} else {
+-			if (F_ISSET(node->mn_flags, F_BIGDATA))
+-				nsize += sizeof(pgno_t);
+-			else
+-				nsize += NODEDSZ(node);
+ 			total += nsize;
+ 			nsize += sizeof(indx_t);
+ 			fprintf(stderr, "key %d: nsize %d, %s%s\n",
+@@ -6185,7 +6308,7 @@ mdb_node_search(MDB_cursor *mc, MDB_val *key, int *exactp)
+ 
+ 			node = NODEPTR(mp, i);
+ 			nodekey.mv_size = NODEKSZ(node);
+-			nodekey.mv_data = NODEKEY(node);
++			nodekey.mv_data = NODEKEY(mp, node);
+ 
+ 			rc = cmp(key, &nodekey);
+ #if MDB_DEBUG
+@@ -6653,6 +6776,8 @@ mdb_page_search_root(MDB_cursor *mc, MDB_val *key, int flags)
+ 		return rc;
+ 
+ 	mp = mc->mc_pg[mc->mc_top];
++	if ((rc = mdb_page_check_agg_schema(mc, mp)) != MDB_SUCCESS)
++		return rc;
+ 	while (IS_BRANCH(mp)) {
+ 		MDB_node	*node;
+ 		indx_t		i;
+@@ -6698,12 +6823,16 @@ mdb_page_search_root(MDB_cursor *mc, MDB_val *key, int flags)
+ 
+ 		if ((rc = mdb_page_get(mc, NODEPGNO(node), &mp, NULL)) != 0)
+ 			return rc;
++		if ((rc = mdb_page_check_agg_schema(mc, mp)) != MDB_SUCCESS)
++			return rc;
+ 
+ 		mc->mc_ki[mc->mc_top] = i;
+ 		if ((rc = mdb_cursor_push(mc, mp)))
+ 			return rc;
+ 
+ ready:
++		if ((rc = mdb_page_check_agg_schema(mc, mp)) != MDB_SUCCESS)
++			return rc;
+ 		if (flags & MDB_PS_MODIFY) {
+ 			if ((rc = mdb_page_touch(mc)) != 0)
+ 				return rc;
+@@ -6747,6 +6876,8 @@ mdb_page_search_lowest(MDB_cursor *mc)
+ 		return rc;
+ 
+ 	mp = mc->mc_pg[mc->mc_top];
++	if ((rc = mdb_page_check_agg_schema(mc, mp)) != MDB_SUCCESS)
++		return rc;
+ 	node = NODEPTR(mp, 0);
+ 	if ((rc = mdb_page_get(mc, NODEPGNO(node), &mp, NULL)) != 0)
+ 		return rc;
+@@ -6787,38 +6918,11 @@ mdb_page_search(MDB_cursor *mc, MDB_val *key, int flags)
+ 		return rc;
+ 
+ 	{
+-		/* Make sure we're using an up-to-date root */
++		/* Make sure we're using an up-to-date root. */
+ 		if (*mc->mc_dbflag & DB_STALE) {
+-				MDB_cursor mc2;
+-				if (TXN_DBI_CHANGED(mc->mc_txn, mc->mc_dbi))
+-					return MDB_BAD_DBI;
+-				mdb_cursor_init(&mc2, mc->mc_txn, MAIN_DBI, NULL);
+-				rc = mdb_page_search(&mc2, &mc->mc_dbx->md_name, 0);
+-				if (rc)
+-					return rc;
+-				{
+-					MDB_val data;
+-					int exact = 0;
+-					uint16_t flags;
+-					MDB_node *leaf = mdb_node_search(&mc2,
+-						&mc->mc_dbx->md_name, &exact);
+-					if (!exact)
+-						return MDB_BAD_DBI;
+-					if ((leaf->mn_flags & (F_DUPDATA|F_SUBDATA)) != F_SUBDATA)
+-						return MDB_INCOMPATIBLE; /* not a named DB */
+-					rc = mdb_node_read(&mc2, leaf, &data);
+-					if (rc)
+-						return rc;
+-					memcpy(&flags, ((char *) data.mv_data + offsetof(MDB_db, md_flags)),
+-						sizeof(uint16_t));
+-					/* The txn may not know this DBI, or another process may
+-					 * have dropped and recreated the DB with other flags.
+-					 */
+-					if ((mc->mc_db->md_flags & PERSISTENT_FLAGS) != flags)
+-						return MDB_INCOMPATIBLE;
+-					memcpy(mc->mc_db, data.mv_data, sizeof(MDB_db));
+-				}
+-				*mc->mc_dbflag &= ~DB_STALE;
++			rc = mdb_dbi_refresh_stale_snapshot(mc->mc_txn, mc->mc_dbi);
++			if (rc)
++				return rc;
+ 		}
+ 		root = mc->mc_db->md_root;
+ 
+@@ -6855,6 +6959,8 @@ mdb_page_search(MDB_cursor *mc, MDB_val *key, int flags)
+ 		if ((rc = mdb_page_touch(mc)))
+ 			return rc;
+ 	}
++	if ((rc = mdb_page_check_agg_schema(mc, mc->mc_pg[0])) != MDB_SUCCESS)
++		return rc;
+ 
+ 	if (flags & MDB_PS_ROOTONLY)
+ 		return MDB_SUCCESS;
+@@ -7099,7 +7205,7 @@ mdb_cursor_next(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
+ 				rc = mdb_cursor_next(&mc->mc_xcursor->mx_cursor, data, NULL, MDB_NEXT);
+ 				if (op != MDB_NEXT || rc != MDB_NOTFOUND) {
+ 					if (rc == MDB_SUCCESS)
+-						MDB_GET_KEY(leaf, key);
++						MDB_GET_KEY(mp, leaf, key);
+ 					return rc;
+ 				}
+ 			}
+@@ -7145,7 +7251,9 @@ skip:
+ 	leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
+ 
+ 	if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
+-		mdb_xcursor_init1(mc, leaf);
++		rc = mdb_xcursor_init1(mc, leaf);
++		if (rc)
++			return rc;
+ 		rc = mdb_cursor_first(&mc->mc_xcursor->mx_cursor, data, NULL);
+ 		if (rc != MDB_SUCCESS)
+ 			return rc;
+@@ -7154,7 +7262,7 @@ skip:
+ 			return rc;
+ 	}
+ 
+-	MDB_GET_KEY(leaf, key);
++	MDB_GET_KEY(mp, leaf, key);
+ 	return MDB_SUCCESS;
+ }
+ 
+@@ -7183,7 +7291,7 @@ mdb_cursor_prev(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
+ 				rc = mdb_cursor_prev(&mc->mc_xcursor->mx_cursor, data, NULL, MDB_PREV);
+ 				if (op != MDB_PREV || rc != MDB_NOTFOUND) {
+ 					if (rc == MDB_SUCCESS) {
+-						MDB_GET_KEY(leaf, key);
++						MDB_GET_KEY(mp, leaf, key);
+ 						mc->mc_flags &= ~C_EOF;
+ 					}
+ 					return rc;
+@@ -7230,7 +7338,9 @@ mdb_cursor_prev(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
+ 	leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
+ 
+ 	if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
+-		mdb_xcursor_init1(mc, leaf);
++		rc = mdb_xcursor_init1(mc, leaf);
++		if (rc)
++			return rc;
+ 		rc = mdb_cursor_last(&mc->mc_xcursor->mx_cursor, data, NULL);
+ 		if (rc != MDB_SUCCESS)
+ 			return rc;
+@@ -7239,7 +7349,7 @@ mdb_cursor_prev(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op)
+ 			return rc;
+ 	}
+ 
+-	MDB_GET_KEY(leaf, key);
++	MDB_GET_KEY(mp, leaf, key);
+ 	return MDB_SUCCESS;
+ }
+ 
+@@ -7275,7 +7385,7 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
+ 			nodekey.mv_data = LEAF2KEY(mp, 0, nodekey.mv_size);
+ 		} else {
+ 			leaf = NODEPTR(mp, 0);
+-			MDB_GET_KEY2(leaf, nodekey);
++			MDB_GET_KEY2(mp, leaf, nodekey);
+ 		}
+ 		rc = mc->mc_dbx->md_cmp(key, &nodekey);
+ 		if (rc == 0) {
+@@ -7296,7 +7406,7 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
+ 						 nkeys-1, nodekey.mv_size);
+ 				} else {
+ 					leaf = NODEPTR(mp, nkeys-1);
+-					MDB_GET_KEY2(leaf, nodekey);
++					MDB_GET_KEY2(mp, leaf, nodekey);
+ 				}
+ 				rc = mc->mc_dbx->md_cmp(key, &nodekey);
+ 				if (rc == 0) {
+@@ -7314,7 +7424,7 @@ mdb_cursor_set(MDB_cursor *mc, MDB_val *key, MDB_val *data,
+ 								 mc->mc_ki[mc->mc_top], nodekey.mv_size);
+ 						} else {
+ 							leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
+-							MDB_GET_KEY2(leaf, nodekey);
++							MDB_GET_KEY2(mp, leaf, nodekey);
+ 						}
+ 						rc = mc->mc_dbx->md_cmp(key, &nodekey);
+ 						if (rc == 0) {
+@@ -7394,7 +7504,9 @@ set1:
+ 	}
+ 
+ 	if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
+-		mdb_xcursor_init1(mc, leaf);
++		rc = mdb_xcursor_init1(mc, leaf);
++		if (rc)
++			return rc;
+ 		if (op == MDB_SET || op == MDB_SET_KEY || op == MDB_SET_RANGE) {
+ 			rc = mdb_cursor_first(&mc->mc_xcursor->mx_cursor, data, NULL);
+ 		} else {
+@@ -7436,7 +7548,7 @@ set1:
+ 
+ 	/* The key already matches in all other cases */
+ 	if (op == MDB_SET_RANGE || op == MDB_SET_KEY)
+-		MDB_GET_KEY(leaf, key);
++		MDB_GET_KEY(mp, leaf, key);
+ 	DPRINTF(("==> cursor placed on key [%s]", DKEY(key)));
+ 
+ 	return rc;
+@@ -7476,7 +7588,9 @@ mdb_cursor_first(MDB_cursor *mc, MDB_val *key, MDB_val *data)
+ 	}
+ 
+ 	if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
+-		mdb_xcursor_init1(mc, leaf);
++		rc = mdb_xcursor_init1(mc, leaf);
++		if (rc)
++			return rc;
+ 		rc = mdb_cursor_first(&mc->mc_xcursor->mx_cursor, data, NULL);
+ 		if (rc)
+ 			return rc;
+@@ -7485,7 +7599,7 @@ mdb_cursor_first(MDB_cursor *mc, MDB_val *key, MDB_val *data)
+ 			return rc;
+ 	}
+ 
+-	MDB_GET_KEY(leaf, key);
++	MDB_GET_KEY(mc->mc_pg[mc->mc_top], leaf, key);
+ 	return MDB_SUCCESS;
+ }
+ 
+@@ -7521,7 +7635,9 @@ mdb_cursor_last(MDB_cursor *mc, MDB_val *key, MDB_val *data)
+ 	}
+ 
+ 	if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
+-		mdb_xcursor_init1(mc, leaf);
++		rc = mdb_xcursor_init1(mc, leaf);
++		if (rc)
++			return rc;
+ 		rc = mdb_cursor_last(&mc->mc_xcursor->mx_cursor, data, NULL);
+ 		if (rc)
+ 			return rc;
+@@ -7530,7 +7646,7 @@ mdb_cursor_last(MDB_cursor *mc, MDB_val *key, MDB_val *data)
+ 			return rc;
+ 	}
+ 
+-	MDB_GET_KEY(leaf, key);
++	MDB_GET_KEY(mc->mc_pg[mc->mc_top], leaf, key);
+ 	return MDB_SUCCESS;
+ }
+ 
+@@ -7595,7 +7711,7 @@ mdb_cursor_get(MDB_cursor *mc, MDB_val *key, MDB_val *data,
+ 				key->mv_data = LEAF2KEY(mp, mc->mc_ki[mc->mc_top], key->mv_size);
+ 			} else {
+ 				MDB_node *leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
+-				MDB_GET_KEY(leaf, key);
++				MDB_GET_KEY(mp, leaf, key);
+ 				if (data) {
+ 					if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
+ 						rc = mdb_cursor_get(&mc->mc_xcursor->mx_cursor, data, NULL, MDB_GET_CURRENT);
+@@ -7722,7 +7838,7 @@ fetchm:
+ 		{
+ 			MDB_node *leaf = NODEPTR(mc->mc_pg[mc->mc_top], mc->mc_ki[mc->mc_top]);
+ 			if (!F_ISSET(leaf->mn_flags, F_DUPDATA)) {
+-				MDB_GET_KEY(leaf, key);
++				MDB_GET_KEY(mc->mc_pg[mc->mc_top], leaf, key);
+ 				rc = mdb_node_read(mc, leaf, data);
+ 				break;
+ 			}
+@@ -8130,6 +8246,8 @@ mdb_put_dup_subdb(MDB_cursor *mc, MDB_put_state *ps)
+ 	MDB_db *dummy = &ps->ps_dummy;
+ 	int rc;
+ 
++	memset(dummy, 0, sizeof(*dummy));
++	dummy->md_hash_offset = mc->mc_db->md_hash_offset;
+ 	if (mc->mc_db->md_flags & MDB_DUPFIXED) {
+ 		ps->ps_fp_flags |= P_LEAF2;
+ 		dummy->md_pad = fp->mp_pad;
+@@ -8140,6 +8258,10 @@ mdb_put_dup_subdb(MDB_cursor *mc, MDB_put_state *ps)
+ 		dummy->md_pad = 0;
+ 		dummy->md_flags = 0;
+ 	}
++	/* The dup-subDB inherits the schema through MDB_db.  Its initial
++	 * root is a leaf, so the page itself carries no branch-layout bits. */
++	dummy->md_flags |= DB_AGGFLAGS(mc->mc_db);
++	ps->ps_fp_flags &= ~MDB_AGG_MASK;
+ 	dummy->md_depth = 1;
+ 	dummy->md_branch_pages = 0;
+ 	dummy->md_leaf_pages = 1;
+@@ -8397,7 +8519,9 @@ mdb_put_current(MDB_cursor *mc, MDB_put_state *ps, MDB_node *leaf,
+ 		else if (!(mc->mc_flags & C_SUB))
+ 			memcpy(ps->ps_olddata.mv_data, data->mv_data, data->mv_size);
+ 		else {
+-			memcpy(NODEKEY(leaf), key->mv_data, key->mv_size);
++			/* leaf belongs to the current duplicate-tree leaf page */
++			memcpy(NODEKEY(mc->mc_pg[mc->mc_top], leaf),
++				key->mv_data, key->mv_size);
+ 			*next = MDB_PUT_DONE;
+ 			return mdb_put_fix_parent(mc, key);
+ 		}
+@@ -8501,7 +8625,7 @@ mdb_put_node(MDB_cursor *mc, MDB_put_state *ps, MDB_val *rdata)
+ 		rc = mdb_page_split(mc, key, rdata, P_INVALID, nflags);
+ 	} else {
+ 		/* There is room already in this leaf page. */
+-		rc = mdb_node_add(mc, mc->mc_ki[mc->mc_top], key, rdata, 0, nflags);
++		rc = mdb_node_add(mc, mc->mc_ki[mc->mc_top], key, rdata, 0, nflags, NULL);
+ 		if (rc == 0) {
+ 			/* Adjust other cursors pointing to mp */
+ 			MDB_cursor *m2, *m3;
+@@ -8547,7 +8671,12 @@ mdb_put_sub(MDB_cursor *mc, MDB_put_state *ps)
+ 	if ((flags & (MDB_CURRENT|MDB_APPENDDUP)) == MDB_CURRENT) {
+ 		xflags = MDB_CURRENT|MDB_NOSPILL;
+ 	} else {
+-		mdb_xcursor_init1(mc, leaf);
++		rc = mdb_xcursor_init1(mc, leaf);
++		if (rc) {
++			/* a corrupted or incompatible dupset container */
++			mdb_txn_mark_error(mc->mc_txn, rc);
++			return rc;
++		}
+ 		xflags = (flags & MDB_NODUPDATA) ?
+ 			MDB_NOOVERWRITE|MDB_NOSPILL : MDB_NOSPILL;
+ 	}
+@@ -8984,6 +9113,7 @@ mdb_xcursor_sync(MDB_cursor *mc)
+ 	MDB_node *leaf;
+ 	indx_t ki;
+ 	unsigned int xflags;
++	int rc;
+ 
+ 	if (!mx || !(mc->mc_flags & C_INITIALIZED) || !mc->mc_snum ||
+ 		!(mx->mx_cursor.mc_flags & C_INITIALIZED))
+@@ -9000,7 +9130,9 @@ mdb_xcursor_sync(MDB_cursor *mc)
+ 	}
+ 	ki = mx->mx_cursor.mc_ki[0];
+ 	xflags = mx->mx_cursor.mc_flags & (C_EOF|C_DEL);
+-	mdb_xcursor_init1(mc, leaf);
++	rc = mdb_xcursor_init1(mc, leaf);
++	if (rc)
++		return rc;
+ 	mx->mx_cursor.mc_ki[0] = ki;
+ 	mx->mx_cursor.mc_flags |= xflags;
+ 	return MDB_SUCCESS;
+@@ -9040,7 +9172,10 @@ mdb_page_new(MDB_cursor *mc, uint32_t flags, int num, MDB_page **mp)
+ 		return rc;
+ 	DPRINTF(("allocated new mpage %"Yu", page size %u",
+ 	    np->mp_pgno, mc->mc_txn->mt_env->me_psize));
+-	np->mp_flags = flags | P_DIRTY;
++	np->mp_flags = (flags | P_DIRTY) & ~MDB_AGG_MASK;
++	/* Aggregate page bits describe branch-node prefix layout only. */
++	if (mc->mc_db && (flags & P_BRANCH))
++		np->mp_flags |= (mc->mc_db->md_flags & MDB_AGG_MASK);
+ 	np->mp_lower = (PAGEHDRSZ-PAGEBASE);
+ 	np->mp_upper = mc->mc_txn->mt_env->me_psize - PAGEBASE;
+ 
+@@ -9093,11 +9228,12 @@ mdb_leaf_size(MDB_env *env, MDB_val *key, MDB_val *data)
+  * @return The number of bytes needed to store the node.
+  */
+ static size_t
+-mdb_branch_size(MDB_env *env, MDB_val *key)
++mdb_branch_size(MDB_env *env, MDB_page *mp, MDB_val *key)
+ {
+ 	size_t		 sz;
+ 
+-	sz = INDXSIZE(key);
++	/* Prefix is independently EVEN-padded before the key. */
++	sz = INDXSIZE(key) + mdb_agg_prefix_bytes(mp);
+ 	if (sz > env->me_nodemax) {
+ 		/* put on overflow page */
+ 		/* not implemented */
+@@ -9125,7 +9261,8 @@ mdb_branch_size(MDB_env *env, MDB_val *key)
+  */
+ static int
+ mdb_node_add(MDB_cursor *mc, indx_t indx,
+-    MDB_val *key, MDB_val *data, pgno_t pgno, unsigned int flags)
++    MDB_val *key, MDB_val *data, pgno_t pgno, unsigned int flags,
++    const MDB_aggblob *branch_agg)
+ {
+ 	unsigned int	 i;
+ 	size_t		 node_size = NODESIZE;
+@@ -9162,6 +9299,7 @@ mdb_node_add(MDB_cursor *mc, indx_t indx,
+ 	}
+ 
+ 	room = (ssize_t)SIZELEFT(mp) - (ssize_t)sizeof(indx_t);
++	node_size += mdb_agg_prefix_bytes(mp);
+ 	if (key != NULL)
+ 		node_size += EVEN(key->mv_size);
+ 	if (IS_LEAF(mp)) {
+@@ -9212,8 +9350,18 @@ update:
+ 	else
+ 		SETPGNO(node,pgno);
+ 
++	/* Aggregate bytes are opaque in aggformat.  Existing branch links may carry
++	 * a blob that must survive structural relocation; newly-created links use
++	 * deterministic zero bytes, which remain semantically undefined here. */
++	if (mdb_agg_prefix_bytes(mp)) {
++		if (branch_agg)
++			mdb_node_set_agg_blob(mp, node, branch_agg);
++		else
++			memset(node->mn_data, 0, mdb_agg_prefix_bytes(mp));
++	}
++
+ 	if (key)
+-		memcpy(NODEKEY(node), key->mv_data, key->mv_size);
++		memcpy(NODEKEY(mp, node), key->mv_data, key->mv_size);
+ 
+ 	if (IS_LEAF(mp)) {
+ 		ndata = NODEDATA(node);
+@@ -9276,14 +9424,7 @@ mdb_node_del(MDB_cursor *mc, int ksize)
+ 	}
+ 
+ 	node = NODEPTR(mp, indx);
+-	sz = NODESIZE + EVEN(node->mn_ksize);
+-	if (IS_LEAF(mp)) {
+-		if (F_ISSET(node->mn_flags, F_BIGDATA))
+-			sz += sizeof(pgno_t);
+-		else
+-			sz += NODEDSZ(node);
+-	}
+-	sz = EVEN(sz);
++	sz = (unsigned int)mdb_node_datasize(mp, node);
+ 
+ 	ptr = MP_PTRS(mp)[indx];
+ 	for (i = j = 0; i < numkeys; i++) {
+@@ -9384,13 +9525,63 @@ mdb_xcursor_init0(MDB_cursor *mc)
+  * @param[in] node The data containing the #MDB_db record for the
+  * sorted-dup database.
+  */
+-static void
++static int
+ mdb_xcursor_init1(MDB_cursor *mc, MDB_node *node)
+ {
+-	if (node->mn_flags & F_SUBDATA)
+-		mdb_xcursor_init_container(mc, NULL, NODEDATA(node));
+-	else
+-		mdb_xcursor_init_container(mc, NODEDATA(node), NULL);
++	uint16_t want = DB_AGGFLAGS(mc->mc_db);
++	int rc;
++
++	/* The container is read from a persistent node: validate it before
++	 * the sub-cursor uses it. */
++	if (node->mn_flags & F_SUBDATA) {
++		MDB_db db;
++		MDB_page *rmp;
++
++		if (NODEDSZ(node) != sizeof(MDB_db))
++			return MDB_CORRUPTED;
++		memcpy(&db, NODEDATA(node), sizeof(MDB_db));
++		/* A persistent dup-subDB is a physical continuation of the parent
++		 * dupset and therefore must use the same aggregate branch layout. */
++		if (DB_AGGSCHEMAFLAGS(&db) != want)
++			return MDB_INCOMPATIBLE;
++		if ((want & MDB_AGG_HASHSUM) &&
++			db.md_hash_offset != mc->mc_db->md_hash_offset)
++			return MDB_INCOMPATIBLE;
++		if (db.md_depth == 0) {
++			if (db.md_root != P_INVALID)
++				return MDB_CORRUPTED;
++		} else {
++			if (db.md_root == P_INVALID ||
++				(pgno_t)db.md_root >= mc->mc_txn->mt_next_pgno)
++				return MDB_CORRUPTED;
++			rc = mdb_page_get(&mc->mc_xcursor->mx_cursor, db.md_root, &rmp, NULL);
++			if (rc)
++				return rc;
++			if (db.md_depth == 1) {
++				if (!IS_LEAF(rmp))
++					return MDB_CORRUPTED;
++			} else if (!IS_BRANCH(rmp)) {
++				return MDB_CORRUPTED;
++			}
++			if (PAGE_AGGFLAGS(rmp) != (IS_BRANCH(rmp) ? want : 0))
++				return MDB_CORRUPTED;
++		}
++		mdb_xcursor_init_container(mc, NULL, &db);
++	} else {
++		MDB_page *fp = NODEDATA(node);
++		if (NODEDSZ(node) < PAGEHDRSZ)
++			return MDB_CORRUPTED;
++		if (!IS_LEAF(fp) || !IS_SUBP(fp) || IS_OVERFLOW(fp))
++			return MDB_CORRUPTED;
++		if (PAGE_AGGFLAGS(fp) != 0)
++			return MDB_CORRUPTED;
++		if (MP_LOWER(fp) > MP_UPPER(fp) ||
++			(size_t)MP_LOWER(fp) + PAGEBASE > NODEDSZ(node) ||
++			(size_t)MP_UPPER(fp) + PAGEBASE > NODEDSZ(node))
++			return MDB_CORRUPTED;
++		mdb_xcursor_init_container(mc, fp, NULL);
++	}
++	return MDB_SUCCESS;
+ }
+ 
+ /** Final setup of a sorted-dups cursor from its container: either
+@@ -9410,6 +9601,7 @@ mdb_xcursor_init_container(MDB_cursor *mc, MDB_page *fp, const void *db)
+ 		mx->mx_cursor.mc_snum = 0;
+ 		mx->mx_cursor.mc_top = 0;
+ 	} else {
++		memset(&mx->mx_db, 0, sizeof(mx->mx_db));
+ 		mx->mx_db.md_pad = 0;
+ 		mx->mx_db.md_flags = 0;
+ 		mx->mx_db.md_depth = 1;
+@@ -9417,6 +9609,7 @@ mdb_xcursor_init_container(MDB_cursor *mc, MDB_page *fp, const void *db)
+ 		mx->mx_db.md_leaf_pages = 1;
+ 		mx->mx_db.md_overflow_pages = 0;
+ 		mx->mx_db.md_entries = NUMKEYS(fp);
++		mx->mx_db.md_hash_offset = mc->mc_db->md_hash_offset;
+ 		mx->mx_db.md_root = MP_PGNO(fp);
+ 		mx->mx_cursor.mc_snum = 1;
+ 		mx->mx_cursor.mc_top = 0;
+@@ -9429,6 +9622,7 @@ mdb_xcursor_init_container(MDB_cursor *mc, MDB_page *fp, const void *db)
+ 			if (mc->mc_db->md_flags & MDB_INTEGERDUP)
+ 				mx->mx_db.md_flags |= MDB_INTEGERKEY;
+ 		}
++		mx->mx_db.md_flags |= DB_AGGFLAGS(mc->mc_db);
+ 	}
+ 	DPRINTF(("Sub-db -%u root page %"Yu, mx->mx_cursor.mc_dbi,
+ 		mx->mx_db.md_root));
+@@ -9662,7 +9856,7 @@ mdb_branch_rekey_local(MDB_cursor *mc, MDB_val *key, MDB_split_result *split)
+ 	{
+ 		MDB_val	k2;
+ 		char kbuf2[DKBUF_MAXKEYSIZE*2+1];
+-		k2.mv_data = NODEKEY(node);
++		k2.mv_data = NODEKEY(mp, node);
+ 		k2.mv_size = node->mn_ksize;
+ 		DPRINTF(("update key %u (ofs %u) [%s] to [%s] on page %"Yu,
+ 			indx, ptr,
+@@ -9681,17 +9875,21 @@ mdb_branch_rekey_local(MDB_cursor *mc, MDB_val *key, MDB_split_result *split)
+ 	if (delta) {
+ 		if (delta > 0 && SIZELEFT(mp) < delta) {
+ 			pgno_t pgno;
++			MDB_aggblob oldagg;
++			const MDB_aggblob *oldaggp = NULL;
+ 			int rc;
+ 
+-			/* The replacement does not fit. Remove the old branch node and
+-			 * complete the replacement split locally. No ancestor is touched
+-			 * here; publication is an explicit responsibility of the caller.
+-			 */
++			/* The replacement does not fit. Preserve the opaque branch-link
++			 * metadata while replacing the node through a local split. */
+ 			DPRINTF(("Not enough room, delta = %d, splitting locally...", delta));
+ 			pgno = NODEPGNO(node);
++			if (mdb_agg_prefix_bytes(mp)) {
++				mdb_node_get_agg_blob(mp, node, &oldagg);
++				oldaggp = &oldagg;
++			}
+ 			mdb_node_del(mc, 0);
+ 			rc = mdb_page_split_local(mc, key, NULL, pgno,
+-				MDB_SPLIT_REPLACE, split);
++				MDB_SPLIT_REPLACE, oldaggp, split);
+ 			if (rc)
+ 				mdb_txn_mark_error(mc->mc_txn, rc);
+ 			return rc;
+@@ -9704,7 +9902,8 @@ mdb_branch_rekey_local(MDB_cursor *mc, MDB_val *key, MDB_split_result *split)
+ 		}
+ 
+ 		base = (char *)mp + mp->mp_upper + PAGEBASE;
+-		len = ptr - mp->mp_upper + NODESIZE;
++		/* The aggregate prefix belongs to the node and precedes its key. */
++		len = ptr - mp->mp_upper + NODESIZE + mdb_agg_prefix_bytes(mp);
+ 		memmove(base - delta, base, len);
+ 		mp->mp_upper -= delta;
+ 
+@@ -9716,7 +9915,7 @@ mdb_branch_rekey_local(MDB_cursor *mc, MDB_val *key, MDB_split_result *split)
+ 		node->mn_ksize = key->mv_size;
+ 
+ 	if (key->mv_size)
+-		memcpy(NODEKEY(node), key->mv_data, key->mv_size);
++		memcpy(NODEKEY(mp, node), key->mv_data, key->mv_size);
+ 
+ 	return MDB_SUCCESS;
+ }
+@@ -9782,6 +9981,8 @@ mdb_node_move_local(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft,
+ 	pgno_t srcpg;
+ 	int rc;
+ 	unsigned short flags;
++	MDB_aggblob movedagg;
++	const MDB_aggblob *movedaggp = NULL;
+ 
+ 	DKBUF;
+ 	memset(move, 0, sizeof(*move));
+@@ -9816,7 +10017,7 @@ mdb_node_move_local(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft,
+ 		} else {
+ 			node = NODEPTR(scan.mc_pg[scan.mc_top], 0);
+ 			bkey.mv_size = NODEKSZ(node);
+-			bkey.mv_data = NODEKEY(node);
++			bkey.mv_data = NODEKEY(scan.mc_pg[scan.mc_top], node);
+ 		}
+ 
+ 		rc = mdb_branch_rekey_local(cdst, &bkey, &split);
+@@ -9845,6 +10046,11 @@ mdb_node_move_local(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft,
+ 		mdb_cassert(csrc, !((size_t)srcnode & 1));
+ 		srcpg = NODEPGNO(srcnode);
+ 		flags = srcnode->mn_flags;
++		if (IS_BRANCH(csrc->mc_pg[csrc->mc_top]) &&
++			mdb_agg_prefix_bytes(csrc->mc_pg[csrc->mc_top])) {
++			mdb_node_get_agg_blob(csrc->mc_pg[csrc->mc_top], srcnode, &movedagg);
++			movedaggp = &movedagg;
++		}
+ 		if (csrc->mc_ki[csrc->mc_top] == 0 &&
+ 			IS_BRANCH(csrc->mc_pg[csrc->mc_top])) {
+ 			unsigned int snum = csrc->mc_snum;
+@@ -9860,16 +10066,23 @@ mdb_node_move_local(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft,
+ 			} else {
+ 				s2 = NODEPTR(csrc->mc_pg[csrc->mc_top], 0);
+ 				key.mv_size = NODEKSZ(s2);
+-				key.mv_data = NODEKEY(s2);
++				key.mv_data = NODEKEY(csrc->mc_pg[csrc->mc_top], s2);
+ 			}
+ 			csrc->mc_snum = snum--;
+ 			csrc->mc_top = snum;
+ 		} else {
+ 			key.mv_size = NODEKSZ(srcnode);
+-			key.mv_data = NODEKEY(srcnode);
++			key.mv_data = NODEKEY(csrc->mc_pg[csrc->mc_top], srcnode);
++		}
++		if (IS_BRANCH(csrc->mc_pg[csrc->mc_top])) {
++			/* Branch nodes have no data payload. Their mn_lo/mn_hi fields hold
++			 * the child pgno and mn_data begins with the aggregate prefix. */
++			data.mv_size = 0;
++			data.mv_data = NULL;
++		} else {
++			data.mv_size = NODEDSZ(srcnode);
++			data.mv_data = NODEDATA(srcnode);
+ 		}
+-		data.mv_size = NODEDSZ(srcnode);
+-		data.mv_data = NODEDATA(srcnode);
+ 	}
+ 
+ 	DPRINTF(("moving %s node %u [%s] on page %"Yu" to node %u on page %"Yu,
+@@ -9879,7 +10092,7 @@ mdb_node_move_local(MDB_cursor *csrc, MDB_cursor *cdst, int fromleft,
+ 	    cdst->mc_ki[cdst->mc_top], cdst->mc_pg[cdst->mc_top]->mp_pgno));
+ 
+ 	rc = mdb_node_add(cdst, cdst->mc_ki[cdst->mc_top], &key, &data,
+-		srcpg, flags);
++		srcpg, flags, movedaggp);
+ 	if (rc != MDB_SUCCESS)
+ 		return rc;
+ 	mdb_node_del(csrc, key.mv_size);
+@@ -10018,7 +10231,7 @@ mdb_rebalance_apply_move(MDB_cursor *csrc, MDB_cursor *cdst,
+ 			} else {
+ 				node = NODEPTR(scan.mc_pg[scan.mc_top], 0);
+ 				key.mv_size = NODEKSZ(node);
+-				key.mv_data = NODEKEY(node);
++				key.mv_data = NODEKEY(scan.mc_pg[scan.mc_top], node);
+ 			}
+ 		} else if (IS_LEAF2(child->mc_pg[child->mc_top])) {
+ 			key.mv_size = child->mc_db->md_pad;
+@@ -10027,7 +10240,7 @@ mdb_rebalance_apply_move(MDB_cursor *csrc, MDB_cursor *cdst,
+ 		} else {
+ 			node = NODEPTR(child->mc_pg[child->mc_top], 0);
+ 			key.mv_size = NODEKSZ(node);
+-			key.mv_data = NODEKEY(node);
++			key.mv_data = NODEKEY(child->mc_pg[child->mc_top], node);
+ 		}
+ 		DPRINTF(("update separator for moved child page %"Yu" to [%s]",
+ 			child->mc_pg[child->mc_top]->mp_pgno, DKEY(&key)));
+@@ -10090,7 +10303,7 @@ mdb_page_merge_local(MDB_cursor *csrc, MDB_cursor *cdst,
+ 		key.mv_size = csrc->mc_db->md_pad;
+ 		key.mv_data = METADATA(psrc);
+ 		for (i = 0; i < NUMKEYS(psrc); i++, j++) {
+-			rc = mdb_node_add(cdst, j, &key, NULL, 0, 0);
++			rc = mdb_node_add(cdst, j, &key, NULL, 0, 0, NULL);
+ 			if (rc != MDB_SUCCESS)
+ 				return rc;
+ 			key.mv_data = (char *)key.mv_data + key.mv_size;
+@@ -10113,16 +10326,30 @@ mdb_page_merge_local(MDB_cursor *csrc, MDB_cursor *cdst,
+ 				} else {
+ 					s2 = NODEPTR(mn.mc_pg[mn.mc_top], 0);
+ 					key.mv_size = NODEKSZ(s2);
+-					key.mv_data = NODEKEY(s2);
++					key.mv_data = NODEKEY(mn.mc_pg[mn.mc_top], s2);
+ 				}
+ 			} else {
+ 				key.mv_size = srcnode->mn_ksize;
+-				key.mv_data = NODEKEY(srcnode);
++				key.mv_data = NODEKEY(csrc->mc_pg[csrc->mc_top], srcnode);
+ 			}
+ 
+-			data.mv_size = NODEDSZ(srcnode);
+-			data.mv_data = NODEDATA(srcnode);
+-			rc = mdb_node_add(cdst, j, &key, &data, NODEPGNO(srcnode), srcnode->mn_flags);
++			if (IS_BRANCH(psrc)) {
++				data.mv_size = 0;
++				data.mv_data = NULL;
++			} else {
++				data.mv_size = NODEDSZ(srcnode);
++				data.mv_data = NODEDATA(srcnode);
++			}
++			{
++				MDB_aggblob movedagg;
++				const MDB_aggblob *movedaggp = NULL;
++				if (IS_BRANCH(psrc) && mdb_agg_prefix_bytes(psrc)) {
++					mdb_node_get_agg_blob(psrc, srcnode, &movedagg);
++					movedaggp = &movedagg;
++				}
++				rc = mdb_node_add(cdst, j, &key, &data, NODEPGNO(srcnode),
++					srcnode->mn_flags, movedaggp);
++			}
+ 			if (rc != MDB_SUCCESS)
+ 				return rc;
+ 		}
+@@ -10416,7 +10643,9 @@ mdb_del0_relocate(MDB_cursor *mc)
+ 							if (!(node->mn_flags & F_SUBDATA))
+ 								m3->mc_xcursor->mx_cursor.mc_pg[0] = NODEDATA(node);
+ 						} else {
+-							mdb_xcursor_init1(m3, node);
++							rc = mdb_xcursor_init1(m3, node);
++							if (rc)
++								return rc;
+ 							rc = mdb_cursor_first(&m3->mc_xcursor->mx_cursor, NULL, NULL);
+ 							if (rc)
+ 								return rc;
+@@ -10551,7 +10780,8 @@ mdb_split_result_destroy(MDB_split_result *split)
+  */
+ static int
+ mdb_page_split_local(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata,
+-	pgno_t newpgno, unsigned int nflags, MDB_split_result *split)
++	pgno_t newpgno, unsigned int nflags, const MDB_aggblob *newagg,
++	MDB_split_result *split)
+ {
+ 	unsigned int flags;
+ 	int rc = MDB_SUCCESS;
+@@ -10637,7 +10867,7 @@ mdb_page_split_local(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata,
+ 			if (IS_LEAF(mp))
+ 				nsize = mdb_leaf_size(env, newkey, newdata);
+ 			else
+-				nsize = mdb_branch_size(env, newkey);
++				nsize = mdb_branch_size(env, mp, newkey);
+ 			nsize = EVEN(nsize);
+ 
+ 			/* Grab a page to hold a temporary copy. */
+@@ -10675,14 +10905,7 @@ mdb_page_split_local(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata,
+ 					} else {
+ 						node = (MDB_node *)((char *)mp +
+ 							copy->mp_ptrs[i] + PAGEBASE);
+-						psize += NODESIZE + EVEN(NODEKSZ(node)) + sizeof(indx_t);
+-						if (IS_LEAF(mp)) {
+-							if (F_ISSET(node->mn_flags, F_BIGDATA))
+-								psize += sizeof(pgno_t);
+-							else
+-								psize += NODEDSZ(node);
+-						}
+-						psize = EVEN(psize);
++						psize += (int)mdb_node_footprint(mp, node);
+ 					}
+ 					if (psize > pmax || i == k-j) {
+ 						split_indx = i + (j<0);
+@@ -10697,7 +10920,7 @@ mdb_page_split_local(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata,
+ 				node = (MDB_node *)((char *)mp +
+ 					copy->mp_ptrs[split_indx] + PAGEBASE);
+ 				sepkey.mv_size = node->mn_ksize;
+-				sepkey.mv_data = NODEKEY(node);
++				sepkey.mv_data = NODEKEY(mp, node);
+ 			}
+ 		}
+ 	}
+@@ -10725,7 +10948,7 @@ mdb_page_split_local(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata,
+ 	if (nflags & MDB_APPEND) {
+ 		mc->mc_pg[mc->mc_top] = rp;
+ 		mc->mc_ki[mc->mc_top] = 0;
+-		rc = mdb_node_add(mc, 0, newkey, newdata, newpgno, nflags);
++		rc = mdb_node_add(mc, 0, newkey, newdata, newpgno, nflags, newagg);
+ 		if (rc)
+ 			goto done;
+ 	} else if (!IS_LEAF2(mp)) {
+@@ -10733,34 +10956,44 @@ mdb_page_split_local(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata,
+ 		i = split_indx;
+ 		j = 0;
+ 		do {
+-			if (i == newindx) {
+-				rkey.mv_data = newkey->mv_data;
+-				rkey.mv_size = newkey->mv_size;
+-				if (IS_LEAF(mp))
+-					rdata = newdata;
+-				else
+-					pgno = newpgno;
+-				flags = nflags;
+-				mc->mc_ki[mc->mc_top] = j;
+-			} else {
+-				node = (MDB_node *)((char *)mp +
+-					copy->mp_ptrs[i] + PAGEBASE);
+-				rkey.mv_data = NODEKEY(node);
+-				rkey.mv_size = node->mn_ksize;
+-				if (IS_LEAF(mp)) {
+-					xdata.mv_data = NODEDATA(node);
+-					xdata.mv_size = NODEDSZ(node);
+-					rdata = &xdata;
++			{
++				MDB_aggblob movedagg;
++				const MDB_aggblob *movedaggp = NULL;
++				if (i == newindx) {
++					rkey.mv_data = newkey->mv_data;
++					rkey.mv_size = newkey->mv_size;
++					if (IS_LEAF(mp))
++						rdata = newdata;
++					else {
++						pgno = newpgno;
++						movedaggp = newagg;
++					}
++					flags = nflags;
++					mc->mc_ki[mc->mc_top] = j;
+ 				} else {
+-					pgno = NODEPGNO(node);
++					node = (MDB_node *)((char *)mp +
++						copy->mp_ptrs[i] + PAGEBASE);
++					rkey.mv_data = NODEKEY(mp, node);
++					rkey.mv_size = node->mn_ksize;
++					if (IS_LEAF(mp)) {
++						xdata.mv_data = NODEDATA(node);
++						xdata.mv_size = NODEDSZ(node);
++						rdata = &xdata;
++					} else {
++						pgno = NODEPGNO(node);
++						if (mdb_agg_prefix_bytes(mp)) {
++							mdb_node_get_agg_blob(mp, node, &movedagg);
++							movedaggp = &movedagg;
++						}
++					}
++					flags = node->mn_flags;
+ 				}
+-				flags = node->mn_flags;
+-			}
+ 
+-			if (!IS_LEAF(mp) && j == 0)
+-				rkey.mv_size = 0;
++				if (!IS_LEAF(mp) && j == 0)
++					rkey.mv_size = 0;
+ 
+-			rc = mdb_node_add(mc, j, &rkey, rdata, pgno, flags);
++				rc = mdb_node_add(mc, j, &rkey, rdata, pgno, flags, movedaggp);
++			}
+ 			if (rc)
+ 				goto done;
+ 			if (i == nkeys) {
+@@ -10833,11 +11066,11 @@ mdb_split_root(MDB_cursor *mc, const MDB_split_result *split,
+ 	rootc.mc_snum = 1;
+ 	rootc.mc_top = 0;
+ 	if ((rc = mdb_node_add(&rootc, 0, NULL, NULL,
+-		split->msr_left->mp_pgno, 0)) != MDB_SUCCESS)
++		split->msr_left->mp_pgno, 0, NULL)) != MDB_SUCCESS)
+ 		return rc;
+ 	rootc.mc_ki[0] = 1;
+ 	if ((rc = mdb_node_add(&rootc, 1, &sepkey, NULL,
+-		split->msr_right->mp_pgno, 0)) != MDB_SUCCESS)
++		split->msr_right->mp_pgno, 0, NULL)) != MDB_SUCCESS)
+ 		return rc;
+ 
+ 	*new_root = mc->mc_db->md_depth;
+@@ -11134,7 +11367,8 @@ mdb_level_split_up(MDB_level *L, MDB_level *P, int *rcp)
+ 	L->lv_mn.mc_ki[L->lv_mn.mc_top] = 0;
+ 	L->lv_mn.mc_ki[L->lv_ptop] = c->mc_ki[L->lv_ptop] + 1;
+ 
+-	if (SIZELEFT(c->mc_pg[L->lv_ptop]) < mdb_branch_size(env, &L->lv_sepkey)) {
++	if (SIZELEFT(c->mc_pg[L->lv_ptop]) <
++		mdb_branch_size(env, c->mc_pg[L->lv_ptop], &L->lv_sepkey)) {
+ 		/* The parent overflows: its own local split is completed
+ 		 * before it is published, as the next level. */
+ 		L->lv_mn.mc_snum--;
+@@ -11146,7 +11380,7 @@ mdb_level_split_up(MDB_level *L, MDB_level *P, int *rcp)
+ 		P->lv_owns = 1;
+ 		P->lv_nflags = 0;
+ 		rc = mdb_page_split_local(P->lv_mc, &L->lv_sepkey, NULL,
+-			s->msr_right->mp_pgno, 0, &P->lv_own);
++			s->msr_right->mp_pgno, 0, NULL, &P->lv_own);
+ 		*rcp = rc;
+ 		if (rc) {
+ 			mdb_txn_mark_error(P->lv_mc->mc_txn, rc);
+@@ -11157,7 +11391,7 @@ mdb_level_split_up(MDB_level *L, MDB_level *P, int *rcp)
+ 	}
+ 	L->lv_mn.mc_top--;
+ 	rc = mdb_node_add(&L->lv_mn, L->lv_mn.mc_ki[L->lv_ptop], &L->lv_sepkey,
+-		NULL, s->msr_right->mp_pgno, 0);
++		NULL, s->msr_right->mp_pgno, 0, NULL);
+ 	L->lv_mn.mc_top++;
+ 	if (rc == MDB_SUCCESS)
+ 		mdb_split_adopt_path(c, s, &L->lv_mn);
+@@ -11512,7 +11746,7 @@ mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata,
+ 	MDB_split_result split;
+ 	int rc;
+ 
+-	rc = mdb_page_split_local(mc, newkey, newdata, newpgno, nflags, &split);
++	rc = mdb_page_split_local(mc, newkey, newdata, newpgno, nflags, NULL, &split);
+ 	if (rc) {
+ 		mdb_txn_mark_error(mc->mc_txn, rc);
+ 		goto done;
+@@ -12308,6 +12542,134 @@ mdb_default_cmp(MDB_txn *txn, MDB_dbi dbi)
+ 		 : ((f & MDB_REVERSEDUP) ? mdb_cmp_memnr : mdb_cmp_memn));
+ }
+ 
++
++/* Refresh the per-transaction snapshot of a named database record.
++ * DBI handles are environment-global, while MDB_db is transaction-local and
++ * starts as DB_STALE in a new transaction.  Format metadata beyond md_flags
++ * must never be read from that placeholder.
++ */
++static int
++mdb_dbi_refresh_stale_snapshot(MDB_txn *txn, MDB_dbi dbi)
++{
++	MDB_cursor mc2;
++	MDB_node *leaf;
++	MDB_val data;
++	MDB_db fresh;
++	uint16_t flags;
++	int exact = 0, rc;
++
++	if (!txn || dbi < CORE_DBS || dbi >= txn->mt_numdbs ||
++		!txn->mt_dbxs[dbi].md_name.mv_size)
++		return MDB_BAD_DBI;
++	if (TXN_DBI_CHANGED(txn, dbi))
++		return MDB_BAD_DBI;
++	if (!(txn->mt_dbflags[dbi] & DB_STALE))
++		return MDB_SUCCESS;
++
++	mdb_cursor_init(&mc2, txn, MAIN_DBI, NULL);
++	rc = mdb_page_search(&mc2, &txn->mt_dbxs[dbi].md_name, 0);
++	if (rc)
++		return rc;
++	leaf = mdb_node_search(&mc2, &txn->mt_dbxs[dbi].md_name, &exact);
++	if (!exact)
++		return MDB_BAD_DBI;
++	if ((leaf->mn_flags & (F_DUPDATA|F_SUBDATA)) != F_SUBDATA)
++		return MDB_INCOMPATIBLE;
++	rc = mdb_node_read(&mc2, leaf, &data);
++	if (rc)
++		return rc;
++	if (data.mv_size != sizeof(MDB_db))
++		return MDB_CORRUPTED;
++
++	/* MDB_db payloads in leaf nodes need not satisfy MDB_db alignment. */
++	memcpy(&fresh, data.mv_data, sizeof(fresh));
++	flags = fresh.md_flags;
++	if ((txn->mt_dbs[dbi].md_flags & PERSISTENT_FLAGS) !=
++		(flags & PERSISTENT_FLAGS))
++		return MDB_INCOMPATIBLE;
++
++	txn->mt_dbs[dbi] = fresh;
++	txn->mt_dbflags[dbi] &= ~DB_STALE;
++	return MDB_SUCCESS;
++}
++
++static int
++mdb_dbi_check_tree_layout(MDB_txn *txn, const MDB_db *db)
++{
++	MDB_cursor mc;
++	MDB_xcursor mx;
++	MDB_page *rootp;
++	int rc;
++
++	if (db->md_depth == 0)
++		return db->md_root == P_INVALID ? MDB_SUCCESS : MDB_CORRUPTED;
++	if (db->md_root == P_INVALID || (pgno_t)db->md_root >= txn->mt_next_pgno)
++		return MDB_CORRUPTED;
++
++	/* The helper only needs a transaction-backed cursor for page_get(), but
++	 * mdb_cursor_init() requires an xcursor whenever MAIN_DBI itself is
++	 * DUPSORT (a non-empty DUPSORT main DB failed validation on reopen). */
++	mdb_cursor_init(&mc, txn, MAIN_DBI,
++		(txn->mt_dbs[MAIN_DBI].md_flags & MDB_DUPSORT) ? &mx : NULL);
++	mc.mc_db = (MDB_db *)db;
++	rc = mdb_page_get(&mc, db->md_root, &rootp, NULL);
++	if (rc)
++		return rc;
++	if (db->md_depth == 1) {
++		if (!IS_LEAF(rootp))
++			return MDB_CORRUPTED;
++	} else if (!IS_BRANCH(rootp)) {
++		return MDB_CORRUPTED;
++	}
++	if (PAGE_AGGFLAGS(rootp) != (IS_BRANCH(rootp) ? DB_AGGFLAGS(db) : 0))
++		return MDB_CORRUPTED;
++	return MDB_SUCCESS;
++}
++
++static int
++mdb_dbi_check_agg_request(unsigned int flags)
++{
++	uint16_t reqschema = (uint16_t)(flags & MDB_AGG_SCHEMA_MASK);
++
++	if ((reqschema & MDB_AGG_HASHSOURCE_FROM_KEY) &&
++		!(reqschema & MDB_AGG_HASHSUM))
++		return MDB_INCOMPATIBLE;
++	if ((reqschema & MDB_AGG_HASHSOURCE_FROM_KEY) && (flags & MDB_DUPSORT))
++		return MDB_INCOMPATIBLE;
++	return MDB_SUCCESS;
++}
++
++static int
++mdb_dbi_check_format_flags(const MDB_db *db, unsigned int flags, int is_main, int is_new)
++{
++	unsigned int req;
++	uint16_t reqschema = (uint16_t)(flags & MDB_AGG_SCHEMA_MASK);
++	int rc = mdb_dbi_check_agg_request(flags);
++
++	if (rc)
++		return rc;
++	if ((reqschema & MDB_AGG_HASHSOURCE_FROM_KEY) &&
++		(db->md_flags & MDB_DUPSORT))
++		return MDB_INCOMPATIBLE;
++
++	if ((db->md_flags & MDB_AGG_HASHSOURCE_FROM_KEY) &&
++		(!(db->md_flags & MDB_AGG_HASHSUM) || (db->md_flags & MDB_DUPSORT)))
++		return MDB_INCOMPATIBLE;
++
++	if (!is_main) {
++		/* Aggregate flags define the physical branch-node schema, so an
++		 * explicitly requested aggregate schema must match exactly. Other
++		 * persistent LMDB flags retain the traditional subset check. */
++		if (!is_new && reqschema &&
++			reqschema != (db->md_flags & MDB_AGG_SCHEMA_MASK))
++			return MDB_INCOMPATIBLE;
++		req = flags & (PERSISTENT_FLAGS & ~MDB_AGG_SCHEMA_MASK);
++		if (!is_new && req && ((req & db->md_flags) != req))
++			return MDB_INCOMPATIBLE;
++	}
++	return MDB_SUCCESS;
++}
++
+ int mdb_dbi_open(MDB_txn *txn, const char *name, unsigned int flags, MDB_dbi *dbi)
+ {
+ 	MDB_val key, data;
+@@ -12321,20 +12683,46 @@ int mdb_dbi_open(MDB_txn *txn, const char *name, unsigned int flags, MDB_dbi *db
+ 
+ 	if (flags & ~VALID_FLAGS)
+ 		return EINVAL;
++	rc = mdb_dbi_check_agg_request(flags);
++	if (rc)
++		return rc;
+ 	if (txn->mt_flags & MDB_TXN_BLOCKED)
+ 		return MDB_BAD_TXN;
+ 
+ 	/* main DB? */
+ 	if (!name) {
+-		*dbi = MAIN_DBI;
+-		if (flags & PERSISTENT_FLAGS) {
+-			uint16_t f2 = flags & PERSISTENT_FLAGS;
+-			/* make sure flag changes get committed */
+-			if ((txn->mt_dbs[MAIN_DBI].md_flags | f2) != txn->mt_dbs[MAIN_DBI].md_flags) {
+-				txn->mt_dbs[MAIN_DBI].md_flags |= f2;
+-				txn->mt_flags |= MDB_TXN_DIRTY;
+-			}
++		MDB_db *db = &txn->mt_dbs[MAIN_DBI];
++		MDB_db proposed = *db;
++		uint16_t reqschema = (uint16_t)(flags & MDB_AGG_SCHEMA_MASK);
++		uint16_t haveschema = DB_AGGSCHEMAFLAGS(db);
++		uint16_t f2 = (uint16_t)(flags & (PERSISTENT_FLAGS & ~MDB_AGG_SCHEMA_MASK));
++
++		/* Aggregate bits change branch-node layout and may only be selected or
++		 * changed while the tree is still physically empty. Validate the full
++		 * prospective flag set before mutating the transaction snapshot. */
++		if (reqschema && reqschema != haveschema) {
++			if (db->md_root != P_INVALID || db->md_entries != 0 || db->md_depth != 0)
++				return MDB_INCOMPATIBLE;
++			if (txn->mt_flags & MDB_TXN_RDONLY)
++				return EACCES;
++			proposed.md_flags = (uint16_t)((proposed.md_flags & ~MDB_AGG_SCHEMA_MASK) |
++				reqschema);
++		}
++		proposed.md_flags |= f2;
++		rc = mdb_dbi_check_format_flags(&proposed, flags, 1, 0);
++		if (rc)
++			return rc;
++
++		if (db->md_flags != proposed.md_flags) {
++			db->md_flags = proposed.md_flags;
++			txn->mt_flags |= MDB_TXN_DIRTY;
+ 		}
++
++		rc = mdb_dbi_check_tree_layout(txn, db);
++		if (!rc)
++			*dbi = MAIN_DBI;
++		else
++			return rc;
+ 		mdb_default_cmp(txn, MAIN_DBI);
+ 		MDB_TRACE(("%p, (null), %u = %u", txn, flags, MAIN_DBI));
+ 		return MDB_SUCCESS;
+@@ -12354,8 +12742,17 @@ int mdb_dbi_open(MDB_txn *txn, const char *name, unsigned int flags, MDB_dbi *db
+ 		}
+ 		if (len == txn->mt_dbxs[i].md_name.mv_size &&
+ 			!strncmp(name, txn->mt_dbxs[i].md_name.mv_data, len)) {
+-			*dbi = i;
+-			return MDB_SUCCESS;
++			if (txn->mt_dbflags[i] & DB_STALE) {
++				rc = mdb_dbi_refresh_stale_snapshot(txn, i);
++				if (rc)
++					return rc;
++			}
++			rc = mdb_dbi_check_format_flags(&txn->mt_dbs[i], flags, 0, 0);
++			if (!rc)
++				rc = mdb_dbi_check_tree_layout(txn, &txn->mt_dbs[i]);
++			if (!rc)
++				*dbi = i;
++			return rc;
+ 		}
+ 	}
+ 
+@@ -12402,6 +12799,19 @@ int mdb_dbi_open(MDB_txn *txn, const char *name, unsigned int flags, MDB_dbi *db
+ 		dbflag |= DB_DIRTY;
+ 	}
+ 
++	if (!rc) {
++		MDB_db diskdb;
++		if (data.mv_size != sizeof(MDB_db)) {
++			rc = MDB_CORRUPTED;
++		} else {
++			memcpy(&diskdb, data.mv_data, sizeof(diskdb));
++			rc = mdb_dbi_check_format_flags(&diskdb, flags, 0,
++				(dbflag & DB_DIRTY) != 0);
++			if (!rc && !(dbflag & DB_DIRTY))
++				rc = mdb_dbi_check_tree_layout(txn, &diskdb);
++		}
++	}
++
+ 	if (rc) {
+ 		free(namedup);
+ 	} else {
+@@ -12473,6 +12883,74 @@ int mdb_dbi_flags(MDB_txn *txn, MDB_dbi dbi, unsigned int *flags)
+ 	return MDB_SUCCESS;
+ }
+ 
++int ESECT
++mdb_agg_info(MDB_txn *txn, MDB_dbi dbi, unsigned *agg_flags)
++{
++	int rc;
++	if (!txn || !agg_flags || !TXN_DBI_EXIST(txn, dbi, DB_USRVALID))
++		return EINVAL;
++	if (txn->mt_flags & MDB_TXN_BLOCKED)
++		return MDB_BAD_TXN;
++	if (txn->mt_dbflags[dbi] & DB_STALE) {
++		rc = mdb_dbi_refresh_stale_snapshot(txn, dbi);
++		if (rc)
++			return rc;
++	}
++	*agg_flags = (unsigned)DB_AGGSCHEMAFLAGS(&txn->mt_dbs[dbi]);
++	return MDB_SUCCESS;
++}
++
++int ESECT
++mdb_set_hash_offset(MDB_txn *txn, MDB_dbi dbi, int hash_offset)
++{
++	MDB_db *db;
++	int rc;
++	if (!txn || !TXN_DBI_EXIST(txn, dbi, DB_USRVALID))
++		return EINVAL;
++	if (txn->mt_flags & MDB_TXN_BLOCKED)
++		return (txn->mt_flags & MDB_TXN_ERROR) && txn->mt_last_err ?
++			txn->mt_last_err : MDB_BAD_TXN;
++	if (txn->mt_flags & MDB_TXN_RDONLY)
++		return EACCES;
++	if (txn->mt_dbflags[dbi] & DB_STALE) {
++		rc = mdb_dbi_refresh_stale_snapshot(txn, dbi);
++		if (rc)
++			return rc;
++	}
++	db = &txn->mt_dbs[dbi];
++	if (!(DB_AGGFLAGS(db) & MDB_AGG_HASHSUM))
++		return MDB_INCOMPATIBLE;
++	if (db->md_root != P_INVALID || db->md_entries != 0 || db->md_depth != 0)
++		return MDB_INCOMPATIBLE;
++	if (hash_offset < INT16_MIN || hash_offset > INT16_MAX)
++		return EINVAL;
++	db->md_hash_offset = (int16_t)hash_offset;
++	txn->mt_dbflags[dbi] |= DB_DIRTY;
++	txn->mt_flags |= MDB_TXN_DIRTY;
++	return MDB_SUCCESS;
++}
++
++int ESECT
++mdb_get_hash_offset(MDB_txn *txn, MDB_dbi dbi, int *hash_offset)
++{
++	MDB_db *db;
++	int rc;
++	if (!txn || !hash_offset || !TXN_DBI_EXIST(txn, dbi, DB_USRVALID))
++		return EINVAL;
++	if (txn->mt_flags & MDB_TXN_BLOCKED)
++		return MDB_BAD_TXN;
++	if (txn->mt_dbflags[dbi] & DB_STALE) {
++		rc = mdb_dbi_refresh_stale_snapshot(txn, dbi);
++		if (rc)
++			return rc;
++	}
++	db = &txn->mt_dbs[dbi];
++	if (!(DB_AGGFLAGS(db) & MDB_AGG_HASHSUM))
++		return MDB_INCOMPATIBLE;
++	*hash_offset = (int)db->md_hash_offset;
++	return MDB_SUCCESS;
++}
++
+ /** Add all the DB's pages to the free list.
+  * @param[in] mc Cursor on the DB to free.
+  * @param[in] subs non-Zero to check for sub-DBs in this DB.
+@@ -12527,7 +13005,9 @@ mdb_drop0(MDB_cursor *mc, int subs)
+ 						if (!mc->mc_db->md_overflow_pages && !subs)
+ 							break;
+ 					} else if (subs && (ni->mn_flags & F_SUBDATA)) {
+-						mdb_xcursor_init1(mc, ni);
++						rc = mdb_xcursor_init1(mc, ni);
++						if (rc)
++							goto done;
+ 						rc = mdb_drop0(&mc->mc_xcursor->mx_cursor, 0);
+ 						if (rc)
+ 							goto done;
+@@ -12623,7 +13103,6 @@ int mdb_drop(MDB_txn *txn, MDB_dbi dbi, int del)
+ 		txn->mt_dbs[dbi].md_overflow_pages = 0;
+ 		txn->mt_dbs[dbi].md_entries = 0;
+ 		txn->mt_dbs[dbi].md_root = P_INVALID;
+-
+ 		txn->mt_flags |= MDB_TXN_DIRTY;
+ 	}
+ leave:
+@@ -12892,4 +13371,4 @@ utf8_to_utf16(const char *src, MDB_name *dst, int xtra)
+ 	}
+ }
+ #endif /* defined(_WIN32) */
+-/** @} */
++/** @} */
+\ No newline at end of file

@@ -1,0 +1,3323 @@
+diff --git a/lmdb.h b/lmdb.h
+index c088463..52bd8c0 100644
+--- a/lmdb.h
++++ b/lmdb.h
+@@ -231,12 +231,24 @@ typedef int mdb_filehandle_t;
+ /** Library patch version */
+ #define MDB_VERSION_PATCH	70
+ 
+-/** Aggregate-format intermediate version marker. */
+-#define MDB_AGGFORMAT_VERSION  0x0100
+-
+ /** Combine args a,b,c into a single integer for easy version comparisons */
+ #define MDB_VERINT(a,b,c)	(((a) << 24) | ((b) << 16) | (c))
+ 
++/** AELMDB project version.
++ *
++ * These macros identify this header as AELMDB (rather than upstream LMDB) and
++ * version the AELMDB API/release independently from the inherited LMDB version.
++ */
++#define MDB_AELMDB_VERSION_MAJOR 0
++#define MDB_AELMDB_VERSION_MINOR 2
++#define MDB_AELMDB_VERSION_PATCH 0
++#define MDB_AELMDB_VERSION \
++	MDB_VERINT(MDB_AELMDB_VERSION_MAJOR,MDB_AELMDB_VERSION_MINOR,MDB_AELMDB_VERSION_PATCH)
++#define MDB_AELMDB_VERSION_STRING "AELMDB 0.2.0"
++
++/** Aggregate-enabled persistent-format version marker. */
++#define MDB_AGGFORMAT_VERSION  0x0100
++
+ /** The full library version as a single integer */
+ #define MDB_VERSION_FULL	\
+ 	MDB_VERINT(MDB_VERSION_MAJOR,MDB_VERSION_MINOR,MDB_VERSION_PATCH)
+@@ -357,18 +369,43 @@ typedef void (MDB_rel_func)(MDB_val *item, void *oldptr, void *newptr, void *rel
+ 	/** with #MDB_DUPSORT, use reverse string dups */
+ #define MDB_REVERSEDUP	0x40
+ 
+-	/** Aggregate branch-node layout flags.
+-	 *
+-	 * These bits select which aggregate fields are reserved in every branch
+-	 * node of the database.  This intermediate layer defines only the on-disk
+-	 * representation; aggregate values themselves are not maintained yet.
+-	 */
++/** @name Aggregate build configuration
++ * Compile-time configuration of the aggregate representation/arithmetic.
++ * These values are not database-open flags.
++ * @{
++ */
+ #ifndef MDB_HASH_SIZE
+ #define MDB_HASH_SIZE 32
+ #endif
+ #if (MDB_HASH_SIZE < 1) || (MDB_HASH_SIZE > 256)
+ #error "MDB_HASH_SIZE must be in [1..256]"
+ #endif
++
++/** Select the portable byte-wise hash-sum arithmetic backend.
++ *
++ * The production default is 64-bit limb arithmetic and requires MDB_HASH_SIZE
++ * to be a multiple of 8 bytes.  Define this macro to 1 for validation builds
++ * that intentionally exercise odd/unusual aggregate sizes and alignment. */
++#ifndef MDB_AGG_GENERIC_HASH_ARITH
++#define MDB_AGG_GENERIC_HASH_ARITH 0
++#endif
++#if !MDB_AGG_GENERIC_HASH_ARITH && (MDB_HASH_SIZE % 8)
++#error "optimized hash arithmetic requires MDB_HASH_SIZE to be a multiple of 8; define MDB_AGG_GENERIC_HASH_ARITH=1 for generic validation builds"
++#endif
++/** @} */
++
++	/** Aggregate database flags.
++	 *
++	 * MDB_AGG_ENTRIES maintains the logical record count in branch prefixes;
++	 * MDB_AGG_KEYS maintains distinct primary-key counts; MDB_AGG_HASHSUM
++	 * maintains a modular sum of MDB_HASH_SIZE-byte slices.  By default the
++	 * hash slice is taken from the value; MDB_AGG_HASHSOURCE_FROM_KEY selects
++	 * the key instead and is incompatible with MDB_DUPSORT.
++	 *
++	 * Value-source HASHSUM is incompatible with MDB_RESERVE because reserved
++	 * bytes are finalized after the put call returns.  Key-source HASHSUM on
++	 * a non-DUPSORT DB may use MDB_RESERVE.  MDB_WRITEMAP is supported.
++	 */
+ #define MDB_AGG_ENTRIES	0x80
+ #define MDB_AGG_KEYS		0x100
+ #define MDB_AGG_HASHSUM	0x200
+@@ -1672,24 +1709,144 @@ int	mdb_reader_list(MDB_env *env, MDB_msg_func *func, void *ctx);
+ int	mdb_reader_check(MDB_env *env, int *dead);
+ /**	@} */
+ 
+-/** @brief Retrieve the aggregate-layout schema flags for a DBI.
++/** @brief Retrieve the persistent aggregate schema flags for a DBI.
+  *
+- * This reports the persistent layout flags only.  In the aggformat
+- * intermediate layer the reserved branch-node values are intentionally
+- * unspecified.
++ * The returned value contains MDB_AGG_ENTRIES, MDB_AGG_KEYS,
++ * MDB_AGG_HASHSUM, and MDB_AGG_HASHSOURCE_FROM_KEY as configured.
+  */
+ int mdb_agg_info(MDB_txn *txn, MDB_dbi dbi, unsigned *agg_flags);
+ 
+ /** @brief Set the persistent hash-slice offset for an empty HASHSUM DBI.
+  *
+- * The offset is part of the database schema.  Aggregate values are not
+- * maintained by the aggformat intermediate layer.
++ * Non-negative offsets are measured from the start of the selected hash
++ * source.  Negative offsets are measured backward from the last complete
++ * MDB_HASH_SIZE-byte slice: -1 selects the last slice.
++ *
++ * The setting may be changed only while the DBI is physically empty.
+  */
+ int mdb_set_hash_offset(MDB_txn *txn, MDB_dbi dbi, int hash_offset);
+ 
+ /** @brief Get the persistent hash-slice offset for a HASHSUM DBI. */
+ int mdb_get_hash_offset(MDB_txn *txn, MDB_dbi dbi, int *hash_offset);
+ 
++/** @name Hashsum helper operations
++ * Helpers for the same little-endian modular arithmetic used by MDB_AGG_HASHSUM.
++ * They operate on exactly MDB_HASH_SIZE bytes and are safe for unaligned buffers.
++ * @{ */
++void mdb_hashsum_add(uint8_t *acc, const uint8_t *x);
++void mdb_hashsum_sub(uint8_t *acc, const uint8_t *x);
++void mdb_hashsum_diff(uint8_t *out, const uint8_t *a, const uint8_t *b);
++int mdb_hashsum_is_zero(const uint8_t *p);
++int mdb_hashsum_extract_bytes(const void *p, size_t sz, int hash_offset,
++	uint8_t out[MDB_HASH_SIZE]);
++int mdb_hashsum_extract(const MDB_val *data, int hash_offset,
++	uint8_t out[MDB_HASH_SIZE]);
++/** @} */
++
++/** @defgroup mdb_agg_query Aggregate query operations
++ *
++ * Read-only queries over the aggregate metadata maintained in branch links and
++ * MDB_db totals.  An entry is a logical (key,value) record; in MDB_DUPSORT each
++ * duplicate value is one entry, while MDB_AGG_KEYS counts distinct primary keys.
++ * @{ */
++
++typedef struct MDB_agg {
++	unsigned mv_flags;                     /**< enabled MDB_AGG_* schema flags */
++	uint64_t mv_agg_entries;               /**< logical record count */
++	uint64_t mv_agg_keys;                  /**< distinct primary-key count */
++	uint8_t  mv_agg_hashes[MDB_HASH_SIZE]; /**< modular additive hashsum */
++} MDB_agg;
++
++typedef enum MDB_agg_weight {
++	MDB_AGG_WEIGHT_ENTRIES = MDB_AGG_ENTRIES,
++	MDB_AGG_WEIGHT_KEYS    = MDB_AGG_KEYS
++} MDB_agg_weight;
++
++/** Include an exact prefix boundary. */
++#define MDB_AGG_PREFIX_INCL 0x01u
++/** Include the lower range boundary. */
++#define MDB_RANGE_LOWER_INCL 0x02u
++/** Include the upper range boundary. */
++#define MDB_RANGE_UPPER_INCL 0x04u
++
++/** Return the aggregate of the whole DBI. */
++int mdb_agg_totals(MDB_txn *txn, MDB_dbi dbi, MDB_agg *out);
++
++/** Aggregate all records before (key,data), or through an exact boundary when
++ * MDB_AGG_PREFIX_INCL is set.  If data is NULL, key-only prefix semantics are
++ * used; this includes/excludes the complete duplicate set of the boundary key. */
++int mdb_agg_prefix(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *key, const MDB_val *data, unsigned flags, MDB_agg *out);
++
++/** Aggregate a range.  Bounds are exclusive by default and may be made
++ * inclusive with MDB_RANGE_LOWER_INCL / MDB_RANGE_UPPER_INCL.  In DUPSORT a
++ * non-NULL data bound addresses record order (key,data); NULL data uses key
++ * granularity on that side. */
++int mdb_agg_range(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *low_key, const MDB_val *low_data,
++	const MDB_val *high_key, const MDB_val *high_data,
++	unsigned flags, MDB_agg *out);
++
++#define MDB_AGG_RANK_EXACT     0u
++#define MDB_AGG_RANK_SET_RANGE 1u
++
++/** Return the zero-based rank of a record/key.  SET_RANGE returns the first
++ * record not smaller than the requested boundary. */
++int mdb_agg_rank(MDB_txn *txn, MDB_dbi dbi,
++	MDB_val *key, MDB_val *data, MDB_agg_weight weight,
++	unsigned flags, uint64_t *rank, uint64_t *dup_index);
++
++/** Return the record/key at a zero-based aggregate rank. */
++int mdb_agg_select(MDB_txn *txn, MDB_dbi dbi, MDB_agg_weight weight,
++	uint64_t rank, MDB_val *key, MDB_val *data, uint64_t *dup_index);
++
++/** Position an existing cursor at a zero-based entry rank. */
++int mdb_agg_cursor_seek_rank(MDB_cursor *mc, uint64_t rank,
++	MDB_val *key, MDB_val *data);
++
++/** Cached mapping from a key/record-order window to absolute entry ranks.
++ * Zero-initialize before first use.  A populated window may be reused only
++ * with the same bounds and range flags. */
++typedef struct MDB_agg_window {
++	unsigned mv_flags;
++	unsigned mv_range_flags;
++	uint64_t mv_total_entries;
++	uint64_t mv_abs_lo;
++	uint64_t mv_abs_hi;
++} MDB_agg_window;
++
++/** Sentinel for mdb_agg_window_aggregate(): use the full window end. */
++#define MDB_AGG_WINDOW_END UINT64_MAX
++
++/** Aggregate the relative entry-rank interval [rel_begin, rel_end) inside a
++ * key/record-order window.  MDB_AGG_WINDOW_END selects the window end. */
++int mdb_agg_window_aggregate(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *low_key, const MDB_val *low_data,
++	const MDB_val *high_key, const MDB_val *high_data,
++	unsigned range_flags, MDB_agg_window *window,
++	uint64_t rel_begin, uint64_t rel_end, MDB_agg *out);
++
++/** Return the lower-bound entry rank of (key,data), relative to a cached
++ * key/record-order window and clamped into [0, window_size]. */
++int mdb_agg_window_rank(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *low_key, const MDB_val *low_data,
++	const MDB_val *high_key, const MDB_val *high_data,
++	unsigned range_flags, MDB_agg_window *window,
++	const MDB_val *key, const MDB_val *data, uint64_t *rel_rank);
++
++/** @} */
++
++#if defined(MDB_DEBUG_AGG_INTEGRITY) && MDB_DEBUG_AGG_INTEGRITY
++/** @brief Recursively verify all maintained aggregate invariants for a DBI.
++ *
++ * This is a diagnostic oracle, not part of the maintenance path.  It walks
++ * the complete tree (including persistent DUPSORT sub-DBs), compares every
++ * stored branch prefix with the exact child subtree aggregate, and compares
++ * the root aggregate with the MDB_db totals.
++ */
++int mdb_agg_check_integrity(MDB_txn *txn, MDB_dbi dbi);
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/mdb.c b/mdb.c
+index bca400e..3d41559 100644
+--- a/mdb.c
++++ b/mdb.c
+@@ -1210,64 +1210,55 @@ typedef struct MDB_node {
+ 	/** Address of node \b i in page \b p */
+ #define NODEPTR(p, i)	 ((MDB_node *)((char *)(p) + MP_PTRS(p)[i] + PAGEBASE))
+ 
+-/* Aggregate branch-node prefix layout.  Component bytes are packed in schema
+- * order, then the entire prefix is padded to EVEN() so the following key starts
+- * at the same 2-byte alignment used throughout LMDB.  Accesses to u64 fields
+- * use memcpy and therefore do not assume stronger alignment of MDB_node. */
+-#define MDB_AGG_U64_SIZE ((size_t)sizeof(uint64_t))
+-/* Semantic aggregate bytes and physical prefix bytes are deliberately distinct:
+- * the semantic blob is packed, while the branch-node prefix is EVEN-padded so
+- * the following key keeps LMDB's 2-byte alignment invariant. */
+-#define MDB_AGG_MAXSZ (MDB_AGG_U64_SIZE + MDB_AGG_U64_SIZE + MDB_HASH_SIZE)
+-typedef struct MDB_aggblob {
+-	uint8_t v[MDB_AGG_MAXSZ];
+-} MDB_aggblob;
++/* Aggregate representation/arithmetic is kept separate from the LMDB core. */
++#include "mdb_agg_internal.h"
+ 
+-static inline size_t
+-mdb_agg_value_size_flags(uint16_t agg)
++/* Public hashsum helper layer.  Keep this as a thin wrapper around the single
++ * aggregate arithmetic implementation so clients and maintenance cannot drift. */
++void
++mdb_hashsum_add(uint8_t *acc, const uint8_t *x)
+ {
+-	size_t n = 0;
+-	if (agg & MDB_AGG_ENTRIES) n += MDB_AGG_U64_SIZE;
+-	if (agg & MDB_AGG_KEYS) n += MDB_AGG_U64_SIZE;
+-	if (agg & MDB_AGG_HASHSUM) n += MDB_HASH_SIZE;
+-	return n;
++	mdb_agg_hash_add(acc, x);
+ }
+ 
+-static inline size_t
+-mdb_agg_prefix_len_flags(uint16_t agg)
++void
++mdb_hashsum_sub(uint8_t *acc, const uint8_t *x)
+ {
+-	return EVEN(mdb_agg_value_size_flags(agg));
++	mdb_agg_hash_sub(acc, x);
+ }
+ 
+-static inline size_t
+-mdb_agg_prefix_bytes(const MDB_page *mp)
++void
++mdb_hashsum_diff(uint8_t *out, const uint8_t *a, const uint8_t *b)
+ {
+-	return (mp && IS_BRANCH(mp)) ?
+-		mdb_agg_prefix_len_flags(PAGE_AGGFLAGS(mp)) : 0;
++	memcpy(out, a, MDB_HASH_SIZE);
++	mdb_agg_hash_sub(out, b);
+ }
+ 
+-static inline void
+-mdb_node_get_agg_blob(const MDB_page *mp, const MDB_node *node, MDB_aggblob *out)
++int
++mdb_hashsum_is_zero(const uint8_t *p)
+ {
+-	uint16_t agg = PAGE_AGGFLAGS(mp);
+-	size_t raw = mdb_agg_value_size_flags(agg);
+-	if (raw) memcpy(out->v, node->mn_data, raw);
++	size_t i;
++	for (i = 0; i < MDB_HASH_SIZE; ++i)
++		if (p[i])
++			return 0;
++	return 1;
+ }
+ 
+-static inline void
+-mdb_node_set_agg_blob(MDB_page *mp, MDB_node *node, const MDB_aggblob *in)
++int
++mdb_hashsum_extract_bytes(const void *p, size_t sz, int hash_offset,
++	uint8_t out[MDB_HASH_SIZE])
+ {
+-	uint16_t agg = PAGE_AGGFLAGS(mp);
+-	size_t raw = mdb_agg_value_size_flags(agg);
+-	size_t pfx = mdb_agg_prefix_len_flags(agg);
+-	if (raw) memcpy(node->mn_data, in->v, raw);
+-	if (pfx > raw) memset(node->mn_data + raw, 0, pfx - raw);
++	MDB_val v;
++	v.mv_size = sz;
++	v.mv_data = (void *)p;
++	return mdb_agg_hash_slice(&v, hash_offset, out);
+ }
+ 
+-static inline void *
+-mdb_nodekey(const MDB_page *mp, const MDB_node *node)
++int
++mdb_hashsum_extract(const MDB_val *data, int hash_offset,
++	uint8_t out[MDB_HASH_SIZE])
+ {
+-	return (void *)((char *)node->mn_data + mdb_agg_prefix_bytes(mp));
++	return mdb_agg_hash_slice(data, hash_offset, out);
+ }
+ 
+ 	/** Address of the key for the node. */
+@@ -1334,6 +1325,9 @@ typedef struct MDB_db {
+ 	mdb_size_t	md_entries;		/**< number of logical records */
+ 	/* Aggregate-format fields are reserved persistently here.  The aggformat
+ 	 * layer does not maintain their values. */
++	/* Aggregate totals of the tree.  md_entries remains LMDB's record
++	 * count; md_keys and md_hashsum follow the enabled schema and are
++	 * maintained with the tree (see @ref aggregates). */
+ 	mdb_size_t	md_keys;
+ 	int16_t		md_hash_offset;
+ 	uint8_t		md_hashsum[MDB_HASH_SIZE];
+@@ -1511,12 +1505,16 @@ struct MDB_txn {
+ /** @} */
+ 	unsigned int	mt_flags;		/**< @ref mdb_txn */
+ 	int		mt_last_err;		/**< last error that marked txn invalid */
+-	/** Mutated path of the current put/delete on a main tree: the
++	/** Transaction-owned scratch state for the currently executing mutation.
++	 * Mutated path of the current put/delete on a main tree: the
+ 	 *	levels [0, mt_unwind_prefix) of the operating cursor's path were not
+ 	 *	changed structurally (only the levels at and below it were); set by
+ 	 *	the operation, lowered by #mdb_unwind().  The aggregate stages
+ 	 *	apply the per-level delta to exactly the untouched prefix. */
+ 	int		mt_unwind_prefix;
++	/** The same boundary for the current operation on a duplicate tree
++	 *	(a nested operation of the primary put or delete). */
++	int		mt_unwind_sub_prefix;
+ 	/** #dirty_list room: Array size - \#dirty pages visible to this txn.
+ 	 *	Includes ancestor txns' dirty pages not hidden by other txns'
+ 	 *	dirty/spilled pages. Thus commit(nested txn) has room to merge
+@@ -1890,7 +1888,13 @@ static int	mdb_cursor_push(MDB_cursor *mc, MDB_page *mp);
+ static int	_mdb_cursor_del(MDB_cursor *mc, unsigned int flags);
+ static int	_mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data, unsigned int flags);
+ 
+-static int	mdb_cursor_del0(MDB_cursor *mc);
++static int	mdb_cursor_del0(MDB_cursor *mc, MDB_aggchange *ch);
++static int	mdb_agg_settle(MDB_cursor *mc, const MDB_aggchange *ch);
++static int	mdb_dup_leaf_agg_local(MDB_cursor *mc, const MDB_page *mp,
++	size_t bounded_bytes, MDB_aggval *out);
++static int	mdb_agg_item_at(MDB_cursor *mc, MDB_aggval *out);
++static int	mdb_agg_put_check(MDB_cursor *mc, MDB_val *key, MDB_val *data,
++	unsigned int flags);
+ static int	mdb_del0(MDB_txn *txn, MDB_dbi dbi, MDB_val *key, MDB_val *data, unsigned flags);
+ static int	mdb_cursor_sibling(MDB_cursor *mc, int move_right);
+ static int	mdb_cursor_next(MDB_cursor *mc, MDB_val *key, MDB_val *data, MDB_cursor_op op);
+@@ -7977,58 +7981,129 @@ mdb_path_check(MDB_cursor *mc, const char *where)
+ 	}
+ }
+ 
+-/** Debug oracle for #MDB_txn.mt_unwind_prefix: the pages of the operating
+- * cursor's path above the recorded boundary must be exactly as they were
+- * after the path was made writable (same page, same index, same bytes).
+- * The aggregate stages rely on this: above the boundary only the per-level
+- * delta is applied.  (One saved path at a time: test builds only.) */
+-static struct {
++/** Debug oracle for the main/sub-tree unwind boundaries: the pages of the
++ * operating cursor's path above the recorded boundary must be exactly as they
++ * were after the path was made writable (same page, same index, same bytes).
++ * Aggregate settlement relies on this: above the boundary only the logical
++ * before/after delta is applied.  Main and duplicate trees have independent
++ * snapshots because a nested DUPSORT mutation may occur inside a primary one. */
++typedef struct MDB_path_saved {
+ 	MDB_txn		*txn;
+ 	unsigned int	 snum;
+ 	MDB_page	*pg[CURSOR_STACK];
+ 	indx_t		 ki[CURSOR_STACK];
++	size_t		 len[CURSOR_STACK];
+ 	char		*copy;
+-} mdb_path_saved;
++} MDB_path_saved;
++
++#if defined(_MSC_VER)
++#define MDB_DEBUG_THREAD_LOCAL __declspec(thread)
++#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
++#define MDB_DEBUG_THREAD_LOCAL _Thread_local
++#elif defined(__GNUC__) || defined(__clang__)
++#define MDB_DEBUG_THREAD_LOCAL __thread
++#else
++#error "MDB_DEBUG_UNWIND requires compiler thread-local storage support"
++#endif
++
++/* Debug-only, per-thread snapshots. LMDB serializes writers per environment,
++ * but distinct environments may have concurrent writers in different threads. */
++static MDB_DEBUG_THREAD_LOCAL MDB_path_saved mdb_path_saved[2];
++
++static MDB_path_saved *
++mdb_path_saved_slot(MDB_cursor *mc)
++{
++	return &mdb_path_saved[(mc->mc_flags & C_SUB) ? 1 : 0];
++}
++
++/* Return the actual byte extent of a path element. Normal tree pages occupy
++ * me_psize bytes. An inline duplicate subpage is embedded in a leaf node and
++ * can be much smaller; copying me_psize from it would read beyond the node. */
++static size_t
++mdb_path_snapshot_len(const MDB_page *mp, unsigned int psize)
++{
++	size_t extent;
++	unsigned int i;
++
++	if (!IS_SUBP(mp))
++		return psize;
++	if (IS_LEAF2(mp))
++		return PAGEHDRSZ + (size_t)NUMKEYS(mp) * MP_PAD(mp) + SIZELEFT(mp);
++	if (!NUMKEYS(mp))
++		return PAGEBASE + MP_UPPER(mp);
++	extent = PAGEHDRSZ;
++	for (i = 0; i < NUMKEYS(mp); ++i) {
++		MDB_node *node = NODEPTR(mp, i);
++		size_t nsize = NODESIZE + EVEN(NODEKSZ(node));
++		size_t end;
++
++		if (F_ISSET(node->mn_flags, F_BIGDATA))
++			nsize += sizeof(pgno_t);
++		else
++			nsize += NODEDSZ(node);
++		nsize = EVEN(nsize);
++		end = (size_t)((const char *)node - (const char *)mp) + nsize;
++		if (end > extent)
++			extent = end;
++	}
++	return extent;
++}
+ 
+ static void
+ mdb_path_save(MDB_cursor *mc)
+ {
++	MDB_path_saved *saved = mdb_path_saved_slot(mc);
+ 	unsigned int i, psize = mc->mc_txn->mt_env->me_psize;
+ 
+-	if (!mdb_path_saved.copy)
+-		mdb_path_saved.copy = malloc((size_t)CURSOR_STACK * MAX_PAGESIZE);
+-	mdb_path_saved.txn = mc->mc_txn;
+-	mdb_path_saved.snum = mc->mc_snum;
++	if (!saved->copy)
++		saved->copy = malloc((size_t)CURSOR_STACK * MAX_PAGESIZE);
++	if (!saved->copy)
++		mdb_assert_fail(mc->mc_txn->mt_env, "unwind path snapshot allocation failed",
++			mdb_func_, __FILE__, __LINE__);
++	saved->txn = mc->mc_txn;
++	saved->snum = mc->mc_snum;
+ 	for (i = 0; i < mc->mc_snum; i++) {
+-		mdb_path_saved.pg[i] = mc->mc_pg[i];
+-		mdb_path_saved.ki[i] = mc->mc_ki[i];
+-		memcpy(mdb_path_saved.copy + (size_t)i * MAX_PAGESIZE, mc->mc_pg[i], psize);
++		size_t len = mdb_path_snapshot_len(mc->mc_pg[i], psize);
++		if (len > psize)
++			mdb_assert_fail(mc->mc_txn->mt_env, "invalid unwind snapshot extent",
++				mdb_func_, __FILE__, __LINE__);
++		saved->pg[i] = mc->mc_pg[i];
++		saved->ki[i] = mc->mc_ki[i];
++		saved->len[i] = len;
++		memcpy(saved->copy + (size_t)i * MAX_PAGESIZE, mc->mc_pg[i], len);
+ 	}
+ }
+ 
+ static void
+ mdb_prefix_check(MDB_cursor *mc, const char *where)
+ {
+-	int i, prefix = mc->mc_txn->mt_unwind_prefix;
++	MDB_path_saved *saved = mdb_path_saved_slot(mc);
++	int i, prefix = (mc->mc_flags & C_SUB) ? mc->mc_txn->mt_unwind_sub_prefix :
++		mc->mc_txn->mt_unwind_prefix;
+ 	unsigned int psize = mc->mc_txn->mt_env->me_psize;
+ 	char buf[160];
+ 	const char *bad = NULL;
+ 
+-	if (mdb_path_saved.txn != mc->mc_txn)
++	if (saved->txn != mc->mc_txn)
+ 		return;
+ 	for (i = 0; i < prefix && !bad; i++) {
+-		if ((unsigned)i >= mdb_path_saved.snum || (unsigned)i >= mc->mc_snum)
++		if ((unsigned)i >= saved->snum || (unsigned)i >= mc->mc_snum)
+ 			bad = "boundary below the path";
+-		else if (mc->mc_pg[i] != mdb_path_saved.pg[i])
++		else if (mc->mc_pg[i] != saved->pg[i])
+ 			bad = "other page above the boundary";
+-		else if (mc->mc_ki[i] != mdb_path_saved.ki[i])
++		else if (mc->mc_ki[i] != saved->ki[i])
+ 			bad = "other index above the boundary";
+-		else if (memcmp(mdb_path_saved.copy + (size_t)i * MAX_PAGESIZE, mc->mc_pg[i], psize))
+-			bad = "page above the boundary changed";
++		else {
++			size_t len = mdb_path_snapshot_len(mc->mc_pg[i], psize);
++			if (len != saved->len[i])
++				bad = "page extent above the boundary changed";
++			else if (memcmp(saved->copy + (size_t)i * MAX_PAGESIZE, mc->mc_pg[i], len))
++				bad = "page above the boundary changed";
++		}
+ 	}
+ 	if (bad) {
+-		snprintf(buf, sizeof(buf), "unwind prefix check (%s, prefix %d, level %d): %s",
+-			where, prefix, i - 1, bad);
++		snprintf(buf, sizeof(buf), "unwind prefix check (%s, %s tree, prefix %d, level %d): %s",
++			where, (mc->mc_flags & C_SUB) ? "duplicate" : "primary", prefix, i - 1, bad);
+ 		mdb_assert_fail(mc->mc_txn->mt_env, buf, mdb_func_, __FILE__, __LINE__);
+ 	}
+ }
+@@ -8418,6 +8493,20 @@ mdb_put_dup_prepare(MDB_cursor *mc, MDB_put_state *ps, MDB_node *leaf,
+ 			return rc;
+ 	}
+ 	mdb_put_dup_container(mc, ps);
++	if ((ps->ps_flags & F_SUBDATA) && DB_AGGFLAGS(mc->mc_db)) {
++		/* the totals of the new sub-DB: its root, the old sub-page */
++		MDB_aggval v;
++		rc = mdb_dup_leaf_agg_local(mc, ps->ps_mp, 0, &v);
++		if (rc) {
++			/* mdb_put_dup_subdb() has already allocated the new root page.
++			 * The primary node is not published yet, but the transaction has
++			 * acquired dirty state and must not continue after this failure. */
++			mdb_txn_mark_error(mc->mc_txn, rc);
++			return rc;
++		}
++		ps->ps_dummy.md_keys = (mdb_size_t)v.keys;
++		memcpy(ps->ps_dummy.md_hashsum, v.hashsum, MDB_HASH_SIZE);
++	}
+ 	*next = MDB_PUT_ADD;
+ 	return MDB_SUCCESS;
+ }
+@@ -8785,7 +8874,8 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
+ 	MDB_put_state ps;
+ 	MDB_val *rdata;
+ 	unsigned int nospill;
+-	int rc, found, next, first, bad;
++	int rc, found, next, first, bad, modified = 0;
++	MDB_aggchange ch;
+ 	DKBUF;
+ 
+ 	if (mc == NULL || key == NULL)
+@@ -8812,6 +8902,8 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
+ 	rc = mdb_put_check(mc, key, data);
+ 	if (rc)
+ 		return rc;
++	if (DB_AGGFLAGS(mc->mc_db) && (rc = mdb_agg_put_check(mc, key, data, flags)))
++		return rc;
+ 
+ 	DPRINTF(("==> put db %d key [%s], size %"Z"u, data size %"Z"u",
+ 		DDBI(mc), DKEY(key), key ? key->mv_size : 0, data->mv_size));
+@@ -8826,18 +8918,27 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
+ 	rc = mdb_put_prepare(mc, key, data, flags, nospill, ps.ps_dcount, found);
+ 	if (rc)
+ 		return rc;
+-	if (!(mc->mc_flags & C_SUB)) {
++	if (!(mc->mc_flags & C_SUB))
+ 		/* the leaf changes; a new root is a new tree */
+ 		mc->mc_txn->mt_unwind_prefix = found == MDB_NO_ROOT ? 0 : mc->mc_top;
+-		MDB_PATH_SAVE(mc);
+-	}
++	else
++		mc->mc_txn->mt_unwind_sub_prefix = found == MDB_NO_ROOT ? 0 : mc->mc_top;
++	MDB_PATH_SAVE(mc);
++	/* aggregates: the contribution of the item before the operation */
++	mdb_aggval_zero(&ch.before);
++	if (DB_AGGFLAGS(mc->mc_db) && found == MDB_SUCCESS &&
++		(rc = mdb_agg_item_at(mc, &ch.before)))
++		return rc;
+ 
+ 	ps.ps_flags = flags;
+ 	ps.ps_insert_key = ps.ps_insert_data = found;
+ 	for (first = 1; ; first = 0) {
+ 		rc = mdb_put_leaf(mc, &ps, first, &rdata, &next);
+-		if (rc || next == MDB_PUT_DONE)
+-			return rc;
++		if (rc)
++			goto settle;
++		modified = 1;
++		if (next == MDB_PUT_DONE)
++			goto settle;
+ 		if (next == MDB_PUT_ADD && ps.ps_new_container) {
+ 			/* the nested level first, then the primary node */
+ 			int rc_sub;
+@@ -8899,11 +9000,26 @@ _mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
+ 		}
+ 		if (!rc) {
+ 			MDB_PATH_CHECK(mc, "put");
+-			if (!(mc->mc_flags & C_SUB))
+-				MDB_PREFIX_CHECK(mc, "put");
++			MDB_PREFIX_CHECK(mc, "put");
++		}
++		goto settle;
++	}
++
++settle:
++	/* A put that changed the tree settles its aggregates, even if it
++	 * returns an error that leaves the transaction usable (a nested
++	 * MDB_KEYEXIST after a dupset conversion, see the retained C7 regression test). */
++	if (modified && DB_AGGFLAGS(mc->mc_db) &&
++		!(mc->mc_txn->mt_flags & MDB_TXN_ERROR)) {
++		int rc2 = mdb_agg_item_at(mc, &ch.after);
++		if (!rc2)
++			rc2 = mdb_agg_settle(mc, &ch);
++		if (rc2) {
++			mdb_txn_mark_error(mc->mc_txn, rc2);
++			return rc2;
+ 		}
+-		return rc;
+ 	}
++	return rc;
+ 
+ bad_sub:
+ 	if (rc == MDB_KEYEXIST)	/* should not happen, we deleted that item */
+@@ -9053,6 +9169,7 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
+ {
+ 	MDB_node	*leaf;
+ 	MDB_page	*mp;
++	MDB_aggchange ch, *chp = NULL;
+ 	int rc, done;
+ 
+ 	rc = mdb_del_prepare(mc, flags);
+@@ -9061,7 +9178,18 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
+ 	if (!(mc->mc_flags & C_SUB)) {
+ 		/* the leaf changes */
+ 		mc->mc_txn->mt_unwind_prefix = mc->mc_top;
+-		MDB_PATH_SAVE(mc);
++	} else {
++		mc->mc_txn->mt_unwind_sub_prefix = mc->mc_top;
++	}
++	MDB_PATH_SAVE(mc);
++	if (DB_AGGFLAGS(mc->mc_db)) {
++		/* aggregates: the item goes from its contribution to nothing,
++		 * or (a dupset that keeps values) to its new contribution */
++		rc = mdb_agg_item_at(mc, &ch.before);
++		if (rc)
++			return rc;
++		mdb_aggval_zero(&ch.after);
++		chp = &ch;
+ 	}
+ 
+ 	mp = mc->mc_pg[mc->mc_top];
+@@ -9071,8 +9199,14 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
+ 		leaf = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
+ 		if (F_ISSET(leaf->mn_flags, F_DUPDATA)) {
+ 			rc = mdb_del_dup(mc, leaf, flags, &done);
+-			if (rc || done)
++			if (rc)
+ 				return rc;
++			if (done) {
++				if (chp && ((rc = mdb_agg_item_at(mc, &ch.after)) ||
++					(rc = mdb_agg_settle(mc, chp))))
++					goto fail;
++				return rc;
++			}
+ 		}
+ 		/* LMDB passes F_SUBDATA in 'flags' to delete a DB record */
+ 		else if ((leaf->mn_flags ^ flags) & F_SUBDATA) {
+@@ -9087,7 +9221,7 @@ _mdb_cursor_del(MDB_cursor *mc, unsigned int flags)
+ 				goto fail;
+ 		}
+ 	}
+-	return mdb_cursor_del0(mc);
++	return mdb_cursor_del0(mc, chp);
+ 
+ fail:
+ 	mdb_txn_mark_error(mc->mc_txn, rc);
+@@ -9631,6 +9765,9 @@ mdb_xcursor_init_container(MDB_cursor *mc, MDB_page *fp, const void *db)
+ 		mx->mx_dbx.md_cmp = mdb_cmp_clong;
+ }
+ 
++/* Aggregate maintenance is kept separate from the LMDB mutation core. */
++#include "mdb_agg_maint.c"
++
+ 
+ /** Fixup a sorted-dups cursor due to underlying update.
+  *	Sets up some fields that depend on the data from the main cursor.
+@@ -10661,10 +10798,12 @@ mdb_del0_relocate(MDB_cursor *mc)
+ }
+ 
+ /** Complete a delete operation started by #mdb_cursor_del():
+- * remove the node, rebalance, relocate the cursors.
++ * remove the node, rebalance, settle the aggregates (@p ch, NULL without
++ * aggregates: on the path the rebalance left, before the relocation may move
++ * the cursor to a sibling), relocate the cursors.
+  */
+ static int
+-mdb_cursor_del0(MDB_cursor *mc)
++mdb_cursor_del0(MDB_cursor *mc, MDB_aggchange *ch)
+ {
+ 	int rc;
+ 
+@@ -10672,6 +10811,12 @@ mdb_cursor_del0(MDB_cursor *mc)
+ 	rc = mdb_rebalance(mc);
+ 	if (rc)
+ 		goto fail;
++	/* Verify the structural boundary before aggregate settlement intentionally
++	 * changes the untouched prefix by applying the logical delta. */
++	MDB_PATH_CHECK(mc, "delete, after rebalance");
++	MDB_PREFIX_CHECK(mc, "delete, after rebalance");
++	if (ch && (rc = mdb_agg_settle(mc, ch)))
++		goto fail;
+ 
+ 	/* DB is totally empty now, just bail out.
+ 	 * Other cursors adjustments were already done
+@@ -10682,9 +10827,6 @@ mdb_cursor_del0(MDB_cursor *mc)
+ 		return rc;
+ 	}
+ 
+-	MDB_PATH_CHECK(mc, "delete, after rebalance");
+-	if (!(mc->mc_flags & C_SUB))
+-		MDB_PREFIX_CHECK(mc, "delete, after rebalance");
+ 	rc = mdb_del0_relocate(mc);
+ 	if (!rc)
+ 		MDB_PATH_CHECK(mc, "delete, after relocation");
+@@ -11045,17 +11187,28 @@ mdb_page_split_local(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata,
+ 	return rc;
+ }
+ 
++
+ /** Publish a completed root split by creating a new root. */
+ static int
+ mdb_split_root(MDB_cursor *mc, const MDB_split_result *split,
+ 	MDB_cursor *mn, int *new_root, int *ptop)
+ {
++	MDB_aggblob lagg, ragg;
++	const MDB_aggblob *laggp = NULL, *raggp = NULL;
+ 	MDB_cursor rootc;
+ 	MDB_page *pp;
+ 	MDB_val sepkey = split->msr_sepkey;
+ 	unsigned int old_snum = mc->mc_snum;
+ 	int i, rc;
+ 
++	/* both halves are final: the new root links are exact */
++	if (DB_AGGFLAGS(mc->mc_db)) {
++		if ((rc = mdb_agg_page_blob(mc, split->msr_left, &lagg)) ||
++			(rc = mdb_agg_page_blob(mc, split->msr_right, &ragg)))
++			return rc;
++		laggp = &lagg;
++		raggp = &ragg;
++	}
+ 	if ((rc = mdb_page_new(mc, P_BRANCH, 1, &pp)))
+ 		return rc;
+ 
+@@ -11066,11 +11219,11 @@ mdb_split_root(MDB_cursor *mc, const MDB_split_result *split,
+ 	rootc.mc_snum = 1;
+ 	rootc.mc_top = 0;
+ 	if ((rc = mdb_node_add(&rootc, 0, NULL, NULL,
+-		split->msr_left->mp_pgno, 0, NULL)) != MDB_SUCCESS)
++		split->msr_left->mp_pgno, 0, laggp)) != MDB_SUCCESS)
+ 		return rc;
+ 	rootc.mc_ki[0] = 1;
+ 	if ((rc = mdb_node_add(&rootc, 1, &sepkey, NULL,
+-		split->msr_right->mp_pgno, 0, NULL)) != MDB_SUCCESS)
++		split->msr_right->mp_pgno, 0, raggp)) != MDB_SUCCESS)
+ 		return rc;
+ 
+ 	*new_root = mc->mc_db->md_depth;
+@@ -11312,13 +11465,15 @@ mdb_level_init(MDB_level *L, unsigned int kind, MDB_cursor *mc)
+ 	L->lv_tracking = 0;
+ }
+ 
+-/** Record that the unwind changed tree level @p level of a main tree
+- * (see #MDB_txn.mt_unwind_prefix).  Duplicate trees are not recorded. */
++/** Record that the unwind changed tree level @p level (see
++ * #MDB_txn.mt_unwind_prefix; duplicate trees: mt_unwind_sub_prefix). */
+ static void
+ mdb_unwind_note(MDB_cursor *c, int level)
+ {
+-	if (!(c->mc_flags & C_SUB) && level < c->mc_txn->mt_unwind_prefix)
+-		c->mc_txn->mt_unwind_prefix = level;
++	int *p = (c->mc_flags & C_SUB) ? &c->mc_txn->mt_unwind_sub_prefix :
++		&c->mc_txn->mt_unwind_prefix;
++	if (level < *p)
++		*p = level;
+ }
+ 
+ /** If the active cursor followed the new right child, adopt the final
+@@ -11345,6 +11500,8 @@ mdb_level_split_up(MDB_level *L, MDB_level *P, int *rcp)
+ 	MDB_cursor *c = L->lv_mc;
+ 	const MDB_split_result *s = L->lv_split;
+ 	MDB_env *env = c->mc_txn->mt_env;
++	MDB_aggblob ragg;
++	const MDB_aggblob *raggp = NULL;
+ 	int rc;
+ 
+ 	L->lv_ptop = c->mc_top ? (int)c->mc_top - 1 : -1;
+@@ -11358,6 +11515,24 @@ mdb_level_split_up(MDB_level *L, MDB_level *P, int *rcp)
+ 		return MDB_UP_STOP;
+ 	}
+ 
++	/* Both halves are final: the left link (the page that split) and the
++	 * new right link get exact aggregates before the parent changes, so
++	 * that a split of the parent carries them (see @ref aggregates). */
++	if (DB_AGGFLAGS(c->mc_db)) {
++		rc = mdb_agg_link_exact(c, c->mc_pg[L->lv_ptop],
++			c->mc_ki[L->lv_ptop], s->msr_left);
++		if (!rc)
++			rc = mdb_agg_page_blob(c, s->msr_right, &ragg);
++		if (rc) {
++			/* nothing published: the level is failed like a local split */
++			mdb_txn_mark_error(c->mc_txn, rc);
++			L->lv_local_failed = 1;
++			*rcp = rc;
++			return MDB_UP_STOP;
++		}
++		raggp = &ragg;
++	}
++
+ 	/* publish to the existing parent */
+ 	L->lv_sepkey = s->msr_sepkey;
+ 	L->lv_snum = c->mc_snum;
+@@ -11380,7 +11555,7 @@ mdb_level_split_up(MDB_level *L, MDB_level *P, int *rcp)
+ 		P->lv_owns = 1;
+ 		P->lv_nflags = 0;
+ 		rc = mdb_page_split_local(P->lv_mc, &L->lv_sepkey, NULL,
+-			s->msr_right->mp_pgno, 0, NULL, &P->lv_own);
++			s->msr_right->mp_pgno, 0, raggp, &P->lv_own);
+ 		*rcp = rc;
+ 		if (rc) {
+ 			mdb_txn_mark_error(P->lv_mc->mc_txn, rc);
+@@ -11391,7 +11566,7 @@ mdb_level_split_up(MDB_level *L, MDB_level *P, int *rcp)
+ 	}
+ 	L->lv_mn.mc_top--;
+ 	rc = mdb_node_add(&L->lv_mn, L->lv_mn.mc_ki[L->lv_ptop], &L->lv_sepkey,
+-		NULL, s->msr_right->mp_pgno, 0, NULL);
++		NULL, s->msr_right->mp_pgno, 0, raggp);
+ 	L->lv_mn.mc_top++;
+ 	if (rc == MDB_SUCCESS)
+ 		mdb_split_adopt_path(c, s, &L->lv_mn);
+@@ -11573,6 +11748,12 @@ mdb_level_underflow_up(MDB_level *L, MDB_level *P, int *rcp)
+ 
+ 		rc = mdb_node_move_local(&L->lv_mn, c, L->lv_fromleft, &move);
+ 		mdb_unwind_note(c, ptop);	/* separators in the parent */
++		/* both siblings are final: exact links (see @ref aggregates) */
++		if (!rc && DB_AGGFLAGS(c->mc_db) &&
++			!(rc = mdb_agg_link_exact(c, c->mc_pg[ptop],
++				L->lv_mn.mc_ki[ptop], L->lv_mn.mc_pg[L->lv_mn.mc_top])))
++			rc = mdb_agg_link_exact(c, c->mc_pg[ptop], c->mc_ki[ptop],
++				c->mc_pg[c->mc_top]);
+ 		if (!rc)
+ 			rc = mdb_rebalance_apply_move(&L->lv_mn, c, &move);
+ 		if (L->lv_fromleft) {
+@@ -11596,6 +11777,10 @@ mdb_level_underflow_up(MDB_level *L, MDB_level *P, int *rcp)
+ 			cdst = &L->lv_mn;
+ 		}
+ 		rc = mdb_page_merge_local(csrc, cdst, &L->lv_merge);
++		/* the destination is final: exact link (see @ref aggregates) */
++		if (!rc && DB_AGGFLAGS(c->mc_db))
++			rc = mdb_agg_link_exact(c, cdst->mc_pg[ptop],
++				cdst->mc_ki[ptop], L->lv_merge.mmr_dst);
+ 		if (!rc)
+ 			rc = mdb_rebalance_apply_merge(csrc, cdst, &L->lv_merge);
+ 		*rcp = rc;
+@@ -12951,6 +13136,11 @@ mdb_get_hash_offset(MDB_txn *txn, MDB_dbi dbi, int *hash_offset)
+ 	return MDB_SUCCESS;
+ }
+ 
++/* Aggregate query APIs are kept in a separate source fragment so that the
++ * mutation/maintenance core stays directly comparable across LMDB variants. */
++#include "mdb_agg_query.c"
++
++
+ /** Add all the DB's pages to the free list.
+  * @param[in] mc Cursor on the DB to free.
+  * @param[in] subs non-Zero to check for sub-DBs in this DB.
+@@ -13102,6 +13292,10 @@ int mdb_drop(MDB_txn *txn, MDB_dbi dbi, int del)
+ 		txn->mt_dbs[dbi].md_leaf_pages = 0;
+ 		txn->mt_dbs[dbi].md_overflow_pages = 0;
+ 		txn->mt_dbs[dbi].md_entries = 0;
++		/* keep the schema and hash offset; an empty tree has zero
++		 * aggregate totals */
++		txn->mt_dbs[dbi].md_keys = 0;
++		memset(txn->mt_dbs[dbi].md_hashsum, 0, MDB_HASH_SIZE);
+ 		txn->mt_dbs[dbi].md_root = P_INVALID;
+ 		txn->mt_flags |= MDB_TXN_DIRTY;
+ 	}
+@@ -13371,4 +13565,15 @@ utf8_to_utf16(const char *src, MDB_name *dst, int xtra)
+ 	}
+ }
+ #endif /* defined(_WIN32) */
++
++/* Recursive aggregate verification is diagnostic-only and kept out of the
++ * maintenance core.  It is textually included because it uses private LMDB
++ * page/cursor types and helpers. */
++#ifndef MDB_DEBUG_AGG_INTEGRITY
++#define MDB_DEBUG_AGG_INTEGRITY 0
++#endif
++#if MDB_DEBUG_AGG_INTEGRITY
++#include "mdb_agg_debug.c"
++#endif
++
+ /** @} */
+\ No newline at end of file
+diff --git ab/mdb_agg_debug.c b/mdb_agg_debug.c
+new file mode 100644
+index 0000000..4d84894
+--- /dev/null
++++ b/mdb_agg_debug.c
+@@ -0,0 +1,148 @@
++/* Aggregate integrity oracle.
++ *
++ * This file is intentionally textually included by mdb.c when
++ * MDB_DEBUG_AGG_INTEGRITY is enabled.  It depends on private MDB_page,
++ * MDB_node, MDB_db, MDB_cursor and aggregate helpers and is not a separately
++ * compiled translation unit.
++ *
++ * The oracle is recursive by design and belongs only to diagnostics/tests.  It
++ * never participates in production aggregate maintenance.
++ */
++
++#if MDB_DEBUG_AGG_INTEGRITY
++
++static int
++mdb_agg_debug_subtree(MDB_cursor *mc, pgno_t pgno, MDB_aggval *out);
++
++static int
++mdb_agg_debug_primary_leaf(MDB_cursor *mc, MDB_page *mp, MDB_aggval *out)
++{
++	MDB_aggval total, one;
++	uint16_t agg = DB_AGGFLAGS(mc->mc_db);
++	unsigned int i;
++	int rc;
++
++	if (!IS_LEAF(mp) || IS_LEAF2(mp))
++		return MDB_CORRUPTED;
++	mdb_aggval_zero(&total);
++	for (i = 0; i < NUMKEYS(mp); ++i) {
++		MDB_node *node = NODEPTR(mp, i);
++
++		if ((mc->mc_db->md_flags & MDB_DUPSORT) &&
++			(node->mn_flags & (F_DUPDATA|F_SUBDATA)) == (F_DUPDATA|F_SUBDATA)) {
++			MDB_cursor *dc;
++			MDB_aggval dup_tree, dup_db;
++
++			rc = mdb_xcursor_init1(mc, node);
++			if (rc)
++				return rc;
++			dc = &mc->mc_xcursor->mx_cursor;
++			if (dc->mc_db->md_root == P_INVALID || !dc->mc_db->md_entries)
++				return MDB_CORRUPTED;
++			rc = mdb_agg_debug_subtree(dc, dc->mc_db->md_root, &dup_tree);
++			if (rc)
++				return rc;
++			mdb_db_get_aggval(dc->mc_db, &dup_db);
++			if (!mdb_aggval_equal(DB_AGGFLAGS(dc->mc_db), &dup_tree, &dup_db))
++				return MDB_CORRUPTED;
++			one = dup_tree;
++			if (agg & MDB_AGG_KEYS)
++				one.keys = 1;
++		} else {
++			rc = mdb_primary_leaf_node_agg(mc, mp, node, &one);
++			if (rc)
++				return rc;
++		}
++		rc = mdb_aggval_add(agg, &total, &one);
++		if (rc)
++			return rc;
++	}
++	*out = total;
++	return MDB_SUCCESS;
++}
++
++static int
++mdb_agg_debug_subtree(MDB_cursor *mc, pgno_t pgno, MDB_aggval *out)
++{
++	MDB_page *mp;
++	MDB_aggval total, child, stored;
++	uint16_t agg;
++	unsigned int i;
++	int rc;
++
++	rc = mdb_page_get(mc, pgno, &mp, NULL);
++	if (rc)
++		return rc;
++	rc = mdb_page_check_agg_schema(mc, mp);
++	if (rc)
++		return rc;
++	agg = DB_AGGFLAGS(mc->mc_db);
++
++	if (IS_LEAF(mp)) {
++		if ((mc->mc_flags & C_SUB) || IS_SUBP(mp))
++			return mdb_page_agg_local(mc, mp, out);
++		if (mc->mc_db->md_flags & MDB_DUPSORT)
++			return mdb_agg_debug_primary_leaf(mc, mp, out);
++		return mdb_page_agg_local(mc, mp, out);
++	}
++	if (!IS_BRANCH(mp))
++		return MDB_CORRUPTED;
++
++	mdb_aggval_zero(&total);
++	for (i = 0; i < NUMKEYS(mp); ++i) {
++		MDB_node *node = NODEPTR(mp, i);
++		rc = mdb_agg_debug_subtree(mc, NODEPGNO(node), &child);
++		if (rc)
++			return rc;
++		mdb_node_get_aggval(mp, node, &stored);
++		if (!mdb_aggval_equal(agg, &stored, &child))
++			return MDB_CORRUPTED;
++		rc = mdb_aggval_add(agg, &total, &child);
++		if (rc)
++			return rc;
++	}
++	*out = total;
++	return MDB_SUCCESS;
++}
++
++int ESECT
++mdb_agg_check_integrity(MDB_txn *txn, MDB_dbi dbi)
++{
++	MDB_cursor mc;
++	MDB_xcursor mx;
++	MDB_db *db;
++	MDB_aggval tree, descriptor, zero;
++	int rc;
++
++	if (!txn || !TXN_DBI_EXIST(txn, dbi, DB_USRVALID))
++		return EINVAL;
++	if (txn->mt_flags & MDB_TXN_BLOCKED)
++		return MDB_BAD_TXN;
++	if (txn->mt_dbflags[dbi] & DB_STALE) {
++		rc = mdb_dbi_refresh_stale_snapshot(txn, dbi);
++		if (rc)
++			return rc;
++	}
++	db = &txn->mt_dbs[dbi];
++	if (!DB_AGGFLAGS(db))
++		return MDB_INCOMPATIBLE;
++	rc = mdb_dbi_check_tree_layout(txn, db);
++	if (rc)
++		return rc;
++
++	mdb_db_get_aggval(db, &descriptor);
++	if (db->md_root == P_INVALID) {
++		mdb_aggval_zero(&zero);
++		return mdb_aggval_equal(DB_AGGFLAGS(db), &descriptor, &zero) ?
++			MDB_SUCCESS : MDB_CORRUPTED;
++	}
++
++	mdb_cursor_init(&mc, txn, dbi, &mx);
++	rc = mdb_agg_debug_subtree(&mc, db->md_root, &tree);
++	if (rc)
++		return rc;
++	return mdb_aggval_equal(DB_AGGFLAGS(db), &tree, &descriptor) ?
++		MDB_SUCCESS : MDB_CORRUPTED;
++}
++
++#endif /* MDB_DEBUG_AGG_INTEGRITY */
+diff --git ab/mdb_agg_internal.h b/mdb_agg_internal.h
+new file mode 100644
+index 0000000..d5ade93
+--- /dev/null
++++ b/mdb_agg_internal.h
+@@ -0,0 +1,391 @@
++/* Internal aggregate representation and arithmetic.
++ *
++ * This file is textually included by mdb.c after MDB_node and page-layout
++ * internals are defined.  It is not a public header and deliberately relies
++ * on LMDB private types/macros.
++ */
++
++/* Aggregate branch-node prefix layout.  Component bytes are packed in schema
++ * order, then the entire prefix is padded to EVEN() so the following key starts
++ * at the same 2-byte alignment used throughout LMDB.  Accesses to u64 fields
++ * use memcpy and therefore do not assume stronger alignment of MDB_node. */
++#define MDB_AGG_U64_SIZE ((size_t)sizeof(uint64_t))
++/* Semantic aggregate bytes and physical prefix bytes are deliberately distinct:
++ * the semantic blob is packed, while the branch-node prefix is EVEN-padded so
++ * the following key keeps LMDB's 2-byte alignment invariant. */
++#define MDB_AGG_MAXSZ (MDB_AGG_U64_SIZE + MDB_AGG_U64_SIZE + MDB_HASH_SIZE)
++typedef struct MDB_aggblob {
++	uint8_t v[MDB_AGG_MAXSZ];
++} MDB_aggblob;
++
++/* Normalized semantic aggregate.  Unlike MDB_aggblob this representation is
++ * independent of the selected packed fields.  Disabled components are kept at
++ * zero by decode/construction helpers and are ignored by arithmetic. */
++typedef struct MDB_aggval {
++	uint64_t entries;
++	uint64_t keys;
++	uint8_t hashsum[MDB_HASH_SIZE];
++} MDB_aggval;
++
++/* Net logical mutation.  Structural page rewrites do not create an additional
++ * change: every ancestor observes A' = A - before + after. */
++typedef struct MDB_aggchange {
++	MDB_aggval before;
++	MDB_aggval after;
++} MDB_aggchange;
++
++static inline void
++mdb_aggval_zero(MDB_aggval *val)
++{
++	memset(val, 0, sizeof(*val));
++}
++
++static inline int
++mdb_aggval_equal(uint16_t agg, const MDB_aggval *a, const MDB_aggval *b)
++{
++	agg &= MDB_AGG_MASK;
++	if ((agg & MDB_AGG_ENTRIES) && a->entries != b->entries)
++		return 0;
++	if ((agg & MDB_AGG_KEYS) && a->keys != b->keys)
++		return 0;
++	if ((agg & MDB_AGG_HASHSUM) &&
++		memcmp(a->hashsum, b->hashsum, MDB_HASH_SIZE) != 0)
++		return 0;
++	return 1;
++}
++
++/* MDB_aggblob stores only enabled semantic fields, in persistent schema order.
++ * Physical EVEN() padding is deliberately not part of this conversion. */
++static inline void
++mdb_aggval_from_blob(uint16_t agg, const MDB_aggblob *blob, MDB_aggval *val)
++{
++	const uint8_t *p = blob->v;
++
++	agg &= MDB_AGG_MASK;
++	mdb_aggval_zero(val);
++	if (agg & MDB_AGG_ENTRIES) {
++		memcpy(&val->entries, p, MDB_AGG_U64_SIZE);
++		p += MDB_AGG_U64_SIZE;
++	}
++	if (agg & MDB_AGG_KEYS) {
++		memcpy(&val->keys, p, MDB_AGG_U64_SIZE);
++		p += MDB_AGG_U64_SIZE;
++	}
++	if (agg & MDB_AGG_HASHSUM)
++		memcpy(val->hashsum, p, MDB_HASH_SIZE);
++}
++
++static inline void
++mdb_aggval_to_blob(uint16_t agg, const MDB_aggval *val, MDB_aggblob *blob)
++{
++	uint8_t *p = blob->v;
++
++	agg &= MDB_AGG_MASK;
++	memset(blob, 0, sizeof(*blob));
++	if (agg & MDB_AGG_ENTRIES) {
++		memcpy(p, &val->entries, MDB_AGG_U64_SIZE);
++		p += MDB_AGG_U64_SIZE;
++	}
++	if (agg & MDB_AGG_KEYS) {
++		memcpy(p, &val->keys, MDB_AGG_U64_SIZE);
++		p += MDB_AGG_U64_SIZE;
++	}
++	if (agg & MDB_AGG_HASHSUM)
++		memcpy(p, val->hashsum, MDB_HASH_SIZE);
++}
++
++/* Hash sums are little-endian integers modulo 2^(8*MDB_HASH_SIZE).
++ *
++ * Production builds use 64-bit limbs with carry/borrow; this is substantially
++ * cheaper for the normal hash sizes (8, 16, 24, 32, ... bytes).  Validation
++ * builds may define MDB_AGG_GENERIC_HASH_ARITH=1 to use byte-wise arithmetic,
++ * allowing odd hash sizes that deliberately stress representation/alignment.
++ * Both backends implement exactly the same modular little-endian algebra. */
++#if MDB_AGG_GENERIC_HASH_ARITH
++static inline void
++mdb_agg_hash_add(uint8_t dst[MDB_HASH_SIZE], const uint8_t src[MDB_HASH_SIZE])
++{
++	size_t i;
++	unsigned carry = 0;
++
++	for (i = 0; i < MDB_HASH_SIZE; ++i) {
++		unsigned sum = (unsigned)dst[i] + (unsigned)src[i] + carry;
++		dst[i] = (uint8_t)sum;
++		carry = sum >> 8;
++	}
++}
++
++static inline void
++mdb_agg_hash_sub(uint8_t dst[MDB_HASH_SIZE], const uint8_t src[MDB_HASH_SIZE])
++{
++	size_t i;
++	unsigned borrow = 0;
++
++	for (i = 0; i < MDB_HASH_SIZE; ++i) {
++		unsigned lhs = (unsigned)dst[i];
++		unsigned rhs = (unsigned)src[i] + borrow;
++		dst[i] = (uint8_t)(lhs - rhs);
++		borrow = lhs < rhs;
++	}
++}
++#else
++static inline uint64_t
++mdb_agg_load_le64(const uint8_t *p)
++{
++	uint64_t x;
++	memcpy(&x, p, sizeof(x));
++#if BYTE_ORDER == LITTLE_ENDIAN
++	return x;
++#else
++	return ((x & UINT64_C(0x00000000000000ff)) << 56) |
++	       ((x & UINT64_C(0x000000000000ff00)) << 40) |
++	       ((x & UINT64_C(0x0000000000ff0000)) << 24) |
++	       ((x & UINT64_C(0x00000000ff000000)) << 8)  |
++	       ((x & UINT64_C(0x000000ff00000000)) >> 8)  |
++	       ((x & UINT64_C(0x0000ff0000000000)) >> 24) |
++	       ((x & UINT64_C(0x00ff000000000000)) >> 40) |
++	       ((x & UINT64_C(0xff00000000000000)) >> 56);
++#endif
++}
++
++static inline void
++mdb_agg_store_le64(uint8_t *p, uint64_t x)
++{
++#if BYTE_ORDER != LITTLE_ENDIAN
++	x = ((x & UINT64_C(0x00000000000000ff)) << 56) |
++	    ((x & UINT64_C(0x000000000000ff00)) << 40) |
++	    ((x & UINT64_C(0x0000000000ff0000)) << 24) |
++	    ((x & UINT64_C(0x00000000ff000000)) << 8)  |
++	    ((x & UINT64_C(0x000000ff00000000)) >> 8)  |
++	    ((x & UINT64_C(0x0000ff0000000000)) >> 24) |
++	    ((x & UINT64_C(0x00ff000000000000)) >> 40) |
++	    ((x & UINT64_C(0xff00000000000000)) >> 56);
++#endif
++	memcpy(p, &x, sizeof(x));
++}
++
++#if defined(__GNUC__) || defined(__clang__)
++#define MDB_AGG_ADD3_U64(a,b,cin,out,cout) do { \
++	uint64_t _t; int _c1 = __builtin_add_overflow((a),(b),&_t); \
++	int _c2 = __builtin_add_overflow(_t,(uint64_t)(cin),&(out)); \
++	(cout) = (uint64_t)(_c1 | _c2); \
++} while (0)
++#define MDB_AGG_SUB3_U64(a,b,bin,out,bout) do { \
++	uint64_t _t; int _b1 = __builtin_sub_overflow((a),(b),&_t); \
++	int _b2 = __builtin_sub_overflow(_t,(uint64_t)(bin),&(out)); \
++	(bout) = (uint64_t)(_b1 | _b2); \
++} while (0)
++#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64))
++#include <intrin.h>
++#define MDB_AGG_ADD3_U64(a,b,cin,out,cout) do { \
++	unsigned char _c = _addcarry_u64((unsigned char)(cin),(a),(b),&(out)); \
++	(cout) = _c; \
++} while (0)
++#define MDB_AGG_SUB3_U64(a,b,bin,out,bout) do { \
++	unsigned char _b = _subborrow_u64((unsigned char)(bin),(a),(b),&(out)); \
++	(bout) = _b; \
++} while (0)
++#else
++#define MDB_AGG_ADD3_U64(a,b,cin,out,cout) do { \
++	uint64_t _a=(a), _b=(b), _c=(cin), _s1=_a+_b; \
++	uint64_t _c1=_s1<_a, _s=_s1+_c, _c2=_s<_s1; \
++	(out)=_s; (cout)=_c1|_c2; \
++} while (0)
++#define MDB_AGG_SUB3_U64(a,b,bin,out,bout) do { \
++	uint64_t _a=(a), _b=(b), _bi=(bin), _d1=_a-_b; \
++	uint64_t _b1=_a<_b, _d=_d1-_bi, _b2=_d1<_bi; \
++	(out)=_d; (bout)=_b1|_b2; \
++} while (0)
++#endif
++
++static inline void
++mdb_agg_hash_add(uint8_t dst[MDB_HASH_SIZE], const uint8_t src[MDB_HASH_SIZE])
++{
++	size_t i;
++	uint64_t carry = 0;
++
++	for (i = 0; i < MDB_HASH_SIZE; i += 8) {
++		uint64_t a = mdb_agg_load_le64(dst + i);
++		uint64_t b = mdb_agg_load_le64(src + i);
++		uint64_t sum;
++		MDB_AGG_ADD3_U64(a, b, carry, sum, carry);
++		mdb_agg_store_le64(dst + i, sum);
++	}
++}
++
++static inline void
++mdb_agg_hash_sub(uint8_t dst[MDB_HASH_SIZE], const uint8_t src[MDB_HASH_SIZE])
++{
++	size_t i;
++	uint64_t borrow = 0;
++
++	for (i = 0; i < MDB_HASH_SIZE; i += 8) {
++		uint64_t a = mdb_agg_load_le64(dst + i);
++		uint64_t b = mdb_agg_load_le64(src + i);
++		uint64_t diff;
++		MDB_AGG_SUB3_U64(a, b, borrow, diff, borrow);
++		mdb_agg_store_le64(dst + i, diff);
++	}
++}
++
++#undef MDB_AGG_ADD3_U64
++#undef MDB_AGG_SUB3_U64
++#endif
++
++/* Count overflow/underflow cannot occur for a valid maintainable tree.  Treat
++ * it as an aggregate invariant failure and leave the destination unchanged. */
++static inline int
++mdb_aggval_add(uint16_t agg, MDB_aggval *dst, const MDB_aggval *src)
++{
++	MDB_aggval next = *dst;
++
++	agg &= MDB_AGG_MASK;
++	if ((agg & MDB_AGG_ENTRIES) && UINT64_MAX - next.entries < src->entries)
++		return MDB_CORRUPTED;
++	if ((agg & MDB_AGG_KEYS) && UINT64_MAX - next.keys < src->keys)
++		return MDB_CORRUPTED;
++	if (agg & MDB_AGG_ENTRIES)
++		next.entries += src->entries;
++	if (agg & MDB_AGG_KEYS)
++		next.keys += src->keys;
++	if (agg & MDB_AGG_HASHSUM)
++		mdb_agg_hash_add(next.hashsum, src->hashsum);
++	*dst = next;
++	return MDB_SUCCESS;
++}
++
++static inline int
++mdb_aggval_sub(uint16_t agg, MDB_aggval *dst, const MDB_aggval *src)
++{
++	MDB_aggval next = *dst;
++
++	agg &= MDB_AGG_MASK;
++	if ((agg & MDB_AGG_ENTRIES) && next.entries < src->entries)
++		return MDB_CORRUPTED;
++	if ((agg & MDB_AGG_KEYS) && next.keys < src->keys)
++		return MDB_CORRUPTED;
++	if (agg & MDB_AGG_ENTRIES)
++		next.entries -= src->entries;
++	if (agg & MDB_AGG_KEYS)
++		next.keys -= src->keys;
++	if (agg & MDB_AGG_HASHSUM)
++		mdb_agg_hash_sub(next.hashsum, src->hashsum);
++	*dst = next;
++	return MDB_SUCCESS;
++}
++
++static inline int
++mdb_aggval_apply_change(uint16_t agg, MDB_aggval *dst,
++	const MDB_aggchange *change)
++{
++	MDB_aggval next = *dst;
++	int rc;
++
++	rc = mdb_aggval_sub(agg, &next, &change->before);
++	if (rc)
++		return rc;
++	rc = mdb_aggval_add(agg, &next, &change->after);
++	if (rc)
++		return rc;
++	*dst = next;
++	return MDB_SUCCESS;
++}
++
++/* Extract the configured fixed-width hash source slice.  Negative offsets are
++ * relative to the last complete MDB_HASH_SIZE-byte slice: -1 selects the last
++ * slice, -2 starts one byte earlier, and so on. */
++static inline int
++mdb_agg_hash_slice(const MDB_val *source, int hash_offset,
++	uint8_t out[MDB_HASH_SIZE])
++{
++	size_t start, back;
++
++	if (!source || (source->mv_size && !source->mv_data))
++		return EINVAL;
++	if (hash_offset >= 0) {
++		start = (size_t)hash_offset;
++		if (start > source->mv_size ||
++			MDB_HASH_SIZE > source->mv_size - start)
++			return MDB_BAD_VALSIZE;
++	} else {
++		/* -(hash_offset + 1) is safe for the configured int16_t range and
++		 * maps -1 -> 0, -2 -> 1, ... without signed overflow. */
++		back = (size_t)(-(hash_offset + 1));
++		if (source->mv_size < MDB_HASH_SIZE ||
++			back > source->mv_size - MDB_HASH_SIZE)
++			return MDB_BAD_VALSIZE;
++		start = source->mv_size - MDB_HASH_SIZE - back;
++	}
++	memcpy(out, (const uint8_t *)source->mv_data + start, MDB_HASH_SIZE);
++	return MDB_SUCCESS;
++}
++
++static inline size_t
++mdb_agg_value_size_flags(uint16_t agg)
++{
++	size_t n = 0;
++	if (agg & MDB_AGG_ENTRIES) n += MDB_AGG_U64_SIZE;
++	if (agg & MDB_AGG_KEYS) n += MDB_AGG_U64_SIZE;
++	if (agg & MDB_AGG_HASHSUM) n += MDB_HASH_SIZE;
++	return n;
++}
++
++static inline size_t
++mdb_agg_prefix_len_flags(uint16_t agg)
++{
++	return EVEN(mdb_agg_value_size_flags(agg));
++}
++
++static inline size_t
++mdb_agg_prefix_bytes(const MDB_page *mp)
++{
++	return (mp && IS_BRANCH(mp)) ?
++		mdb_agg_prefix_len_flags(PAGE_AGGFLAGS(mp)) : 0;
++}
++
++static inline void
++mdb_node_get_agg_blob(const MDB_page *mp, const MDB_node *node, MDB_aggblob *out)
++{
++	uint16_t agg = PAGE_AGGFLAGS(mp);
++	size_t raw = mdb_agg_value_size_flags(agg);
++	if (raw) memcpy(out->v, node->mn_data, raw);
++}
++
++static inline void
++mdb_node_set_agg_blob(MDB_page *mp, MDB_node *node, const MDB_aggblob *in)
++{
++	uint16_t agg = PAGE_AGGFLAGS(mp);
++	size_t raw = mdb_agg_value_size_flags(agg);
++	size_t pfx = mdb_agg_prefix_len_flags(agg);
++	if (raw) memcpy(node->mn_data, in->v, raw);
++	if (pfx > raw) memset(node->mn_data + raw, 0, pfx - raw);
++}
++
++
++static inline void
++mdb_node_get_aggval(const MDB_page *mp, const MDB_node *node, MDB_aggval *out)
++{
++	MDB_aggblob blob;
++	uint16_t agg = PAGE_AGGFLAGS(mp);
++
++	memset(&blob, 0, sizeof(blob));
++	mdb_node_get_agg_blob(mp, node, &blob);
++	mdb_aggval_from_blob(agg, &blob, out);
++}
++
++static inline void
++mdb_node_set_aggval(MDB_page *mp, MDB_node *node, const MDB_aggval *in)
++{
++	MDB_aggblob blob;
++	uint16_t agg = PAGE_AGGFLAGS(mp);
++
++	mdb_aggval_to_blob(agg, in, &blob);
++	mdb_node_set_agg_blob(mp, node, &blob);
++}
++
++static inline void *
++mdb_nodekey(const MDB_page *mp, const MDB_node *node)
++{
++	return (void *)((char *)node->mn_data + mdb_agg_prefix_bytes(mp));
++}
++
+diff --git ab/mdb_agg_maint.c b/mdb_agg_maint.c
+new file mode 100644
+index 0000000..005b42f
+--- /dev/null
++++ b/mdb_agg_maint.c
+@@ -0,0 +1,476 @@
++/* Aggregate maintenance internals.
++ *
++ * This file is textually included by mdb.c.  It deliberately uses LMDB
++ * private page/cursor types while keeping aggregate semantics and settlement
++ * out of the mutation-engine body.
++ */
++
++/* Build the contribution of one logical record from the selected hash source.
++ * Counts are one for each enabled component; the hashsum slice is copied only
++ * when requested.  The caller folds this value into a page-local total. */
++static int
++mdb_agg_record_contribution(uint16_t agg, int hash_offset,
++	const MDB_val *hash_source, MDB_aggval *out)
++{
++	MDB_aggval val;
++	int rc;
++
++	mdb_aggval_zero(&val);
++	if (agg & MDB_AGG_ENTRIES)
++		val.entries = 1;
++	if (agg & MDB_AGG_KEYS)
++		val.keys = 1;
++	if (agg & MDB_AGG_HASHSUM) {
++		rc = mdb_agg_hash_slice(hash_source, hash_offset, val.hashsum);
++		if (rc)
++			return rc;
++	}
++	*out = val;
++	return MDB_SUCCESS;
++}
++
++/* Read the aggregate totals stored in an MDB_db descriptor.  md_entries is
++ * LMDB's existing authoritative logical-entry count; the remaining fields are
++ * the semantic totals introduced by aggregate maintenance. */
++static inline void
++mdb_db_get_aggval(const MDB_db *db, MDB_aggval *out)
++{
++	uint16_t agg = DB_AGGFLAGS(db);
++
++	mdb_aggval_zero(out);
++	if (agg & MDB_AGG_ENTRIES)
++		out->entries = (uint64_t)db->md_entries;
++	if (agg & MDB_AGG_KEYS)
++		out->keys = (uint64_t)db->md_keys;
++	if (agg & MDB_AGG_HASHSUM)
++		memcpy(out->hashsum, db->md_hashsum, MDB_HASH_SIZE);
++}
++
++/* Fold one duplicate-tree leaf page.  Duplicate values are represented as
++ * keys of the duplicate tree, so both ENTRIES and KEYS count every item and
++ * the hash source is always the duplicate value itself.  This helper also
++ * handles inline duplicate subpages; bounded_bytes is their containing node
++ * size and is zero for an ordinary full page. */
++static int
++mdb_dup_leaf_agg_local(MDB_cursor *mc, const MDB_page *mp,
++	size_t bounded_bytes, MDB_aggval *out)
++{
++	MDB_aggval total, one;
++	uint16_t agg;
++	unsigned int i, nkeys;
++	int rc;
++
++	if (!mc || !mc->mc_db || !mp || !out)
++		return EINVAL;
++	if (!IS_LEAF(mp) || IS_OVERFLOW(mp))
++		return MDB_CORRUPTED;
++	if (PAGE_AGGFLAGS(mp) != 0)
++		return MDB_CORRUPTED;
++	if (bounded_bytes) {
++		if (bounded_bytes < PAGEHDRSZ ||
++			MP_LOWER(mp) > MP_UPPER(mp) ||
++			(size_t)MP_LOWER(mp) + PAGEBASE > bounded_bytes ||
++			(size_t)MP_UPPER(mp) + PAGEBASE > bounded_bytes)
++			return MDB_CORRUPTED;
++	}
++
++	agg = DB_AGGFLAGS(mc->mc_db);
++	mdb_aggval_zero(&total);
++	nkeys = NUMKEYS(mp);
++	if (IS_LEAF2(mp)) {
++		size_t ksize = MP_PAD(mp);
++
++		if (nkeys && !ksize)
++			return MDB_CORRUPTED;
++		if (bounded_bytes && nkeys &&
++			(size_t)PAGEHDRSZ + (size_t)nkeys * ksize > bounded_bytes)
++			return MDB_CORRUPTED;
++		for (i = 0; i < nkeys; ++i) {
++			MDB_val value;
++			value.mv_size = ksize;
++			value.mv_data = LEAF2KEY(mp, i, ksize);
++			rc = mdb_agg_record_contribution(agg,
++				mc->mc_db->md_hash_offset, &value, &one);
++			if (rc)
++				return rc;
++			rc = mdb_aggval_add(agg, &total, &one);
++			if (rc)
++				return rc;
++		}
++	} else {
++		for (i = 0; i < nkeys; ++i) {
++			MDB_node *node;
++			MDB_val value;
++
++			if (bounded_bytes) {
++				size_t off = (size_t)MP_PTRS(mp)[i] + PAGEBASE;
++				if (off > bounded_bytes || NODESIZE > bounded_bytes - off)
++					return MDB_CORRUPTED;
++			}
++			node = NODEPTR(mp, i);
++			/* Duplicate-tree records are flat keys with empty data.  Nested
++			 * duplicate/subDB/overflow forms are not valid here. */
++			if (node->mn_flags & (F_BIGDATA|F_DUPDATA|F_SUBDATA))
++				return MDB_CORRUPTED;
++			if (bounded_bytes) {
++				size_t off = (size_t)((const char *)node - (const char *)mp);
++				size_t need = EVEN(NODESIZE + EVEN((size_t)node->mn_ksize) +
++					(size_t)NODEDSZ(node));
++				if (need > bounded_bytes - off)
++					return MDB_CORRUPTED;
++			}
++			value.mv_size = node->mn_ksize;
++			value.mv_data = NODEKEY(mp, node);
++			rc = mdb_agg_record_contribution(agg,
++				mc->mc_db->md_hash_offset, &value, &one);
++			if (rc)
++				return rc;
++			rc = mdb_aggval_add(agg, &total, &one);
++			if (rc)
++				return rc;
++		}
++	}
++
++	*out = total;
++	return MDB_SUCCESS;
++}
++
++/* Compute the contribution of one node in a primary-tree leaf. */
++static int
++mdb_primary_leaf_node_agg(MDB_cursor *mc, const MDB_page *mp,
++	MDB_node *node, MDB_aggval *out)
++{
++	MDB_aggval val;
++	uint16_t agg = DB_AGGFLAGS(mc->mc_db);
++	MDB_val source;
++	int rc;
++
++	if (mc->mc_db->md_flags & MDB_DUPSORT) {
++		if (mc->mc_db->md_flags & MDB_AGG_HASHSOURCE_FROM_KEY)
++			return MDB_INCOMPATIBLE;
++		if (node->mn_flags & F_DUPDATA) {
++			if (node->mn_flags & F_SUBDATA) {
++				MDB_db dupdb;
++
++				if (NODEDSZ(node) != sizeof(MDB_db))
++					return MDB_CORRUPTED;
++				memcpy(&dupdb, NODEDATA(node), sizeof(dupdb));
++				/* A persistent duplicate DB uses the parent's physical
++				 * aggregate schema, but never key-source semantics. */
++				if (DB_AGGSCHEMAFLAGS(&dupdb) != agg)
++					return MDB_INCOMPATIBLE;
++				if ((agg & MDB_AGG_HASHSUM) &&
++					dupdb.md_hash_offset != mc->mc_db->md_hash_offset)
++					return MDB_INCOMPATIBLE;
++				if (dupdb.md_entries == 0)
++					return MDB_CORRUPTED;
++				mdb_db_get_aggval(&dupdb, &val);
++			} else {
++				MDB_page *subp = NODEDATA(node);
++
++				if (NODEDSZ(node) < PAGEHDRSZ || !IS_SUBP(subp))
++					return MDB_CORRUPTED;
++				rc = mdb_dup_leaf_agg_local(mc, subp, NODEDSZ(node), &val);
++				if (rc)
++					return rc;
++				if (NUMKEYS(subp) == 0)
++					return MDB_CORRUPTED;
++			}
++
++			/* The primary tree represents the whole dupset as one distinct
++			 * key, while preserving duplicate multiplicity and hashsum. */
++			if (agg & MDB_AGG_KEYS)
++				val.keys = 1;
++			*out = val;
++			return MDB_SUCCESS;
++		}
++	}
++
++	/* Plain records, and the singleton representation of a DUPSORT key. */
++	if (node->mn_flags & F_DUPDATA)
++		return MDB_CORRUPTED;
++	if ((agg & MDB_AGG_HASHSUM) &&
++		(mc->mc_db->md_flags & MDB_AGG_HASHSOURCE_FROM_KEY)) {
++		source.mv_size = node->mn_ksize;
++		source.mv_data = NODEKEY(mp, node);
++	} else if (agg & MDB_AGG_HASHSUM) {
++		MDB_cursor scan = *mc;
++
++		MC_SET_OVPG(&scan, NULL);
++		rc = mdb_node_read(&scan, node, &source);
++		if (rc)
++			return rc;
++		rc = mdb_agg_record_contribution(agg,
++			mc->mc_db->md_hash_offset, &source, &val);
++#ifdef MDB_VL32
++		if (MC_OVPG(&scan))
++			MDB_PAGE_UNREF(scan.mc_txn, MC_OVPG(&scan));
++#endif
++		if (rc)
++			return rc;
++		*out = val;
++		return MDB_SUCCESS;
++	} else {
++		source.mv_size = 0;
++		source.mv_data = NULL;
++	}
++
++	return mdb_agg_record_contribution(agg, mc->mc_db->md_hash_offset,
++		&source, out);
++}
++
++/* Contribution of one item in a flat aggregate tree.  For C_SUB the duplicate
++ * value is physically stored as the key of the duplicate tree, including the
++ * LEAF2 representation used by MDB_DUPFIXED; in a primary tree it is the
++ * contribution of the leaf node (a whole dupset counts as one key). */
++static int
++mdb_flat_leaf_item_agg(MDB_cursor *mc, const MDB_page *mp,
++	unsigned int index, MDB_aggval *out)
++{
++	MDB_val source;
++	MDB_node *node;
++	uint16_t agg;
++
++	if (!mc || !mc->mc_db || !mp || !out || !IS_LEAF(mp) ||
++		index >= NUMKEYS(mp))
++		return MDB_CORRUPTED;
++	agg = DB_AGGFLAGS(mc->mc_db);
++	if (mc->mc_flags & C_SUB) {
++		if (IS_LEAF2(mp)) {
++			source.mv_size = mc->mc_db->md_pad;
++			source.mv_data = LEAF2KEY(mp, index, source.mv_size);
++		} else {
++			node = NODEPTR(mp, index);
++			if (node->mn_flags & (F_BIGDATA|F_DUPDATA|F_SUBDATA))
++				return MDB_CORRUPTED;
++			source.mv_size = NODEKSZ(node);
++			source.mv_data = NODEKEY(mp, node);
++		}
++		return mdb_agg_record_contribution(agg, mc->mc_db->md_hash_offset,
++			&source, out);
++	}
++	if (IS_LEAF2(mp))
++		return MDB_CORRUPTED;
++	node = NODEPTR(mp, index);
++	return mdb_primary_leaf_node_agg(mc, mp, node, out);
++}
++
++/* Exact aggregate of one final local page.  This is deliberately non-recursive:
++ * branch pages fold already-maintained child prefixes; primary leaf pages fold
++ * only their local records; inline duplicate subpages are scanned locally; a
++ * persistent duplicate subDB contributes through its embedded MDB_db totals. */
++static int
++mdb_page_agg_local(MDB_cursor *mc, const MDB_page *mp, MDB_aggval *out)
++{
++	MDB_aggval total, one;
++	uint16_t agg;
++	unsigned int i, nkeys;
++	int rc;
++
++	if (!mc || !mc->mc_db || !mp || !out)
++		return EINVAL;
++	rc = mdb_page_check_agg_schema(mc, mp);
++	if (rc)
++		return rc;
++	agg = DB_AGGFLAGS(mc->mc_db);
++	mdb_aggval_zero(&total);
++
++	if (IS_BRANCH(mp)) {
++		nkeys = NUMKEYS(mp);
++		for (i = 0; i < nkeys; ++i) {
++			mdb_node_get_aggval(mp, NODEPTR(mp, i), &one);
++			rc = mdb_aggval_add(agg, &total, &one);
++			if (rc)
++				return rc;
++		}
++	} else if (IS_LEAF(mp)) {
++		if (IS_SUBP(mp) || (mc->mc_flags & C_SUB))
++			return mdb_dup_leaf_agg_local(mc, mp, 0, out);
++		if (IS_LEAF2(mp))
++			return MDB_CORRUPTED;
++		nkeys = NUMKEYS(mp);
++		for (i = 0; i < nkeys; ++i) {
++			rc = mdb_primary_leaf_node_agg(mc, mp, NODEPTR(mp, i), &one);
++			if (rc)
++				return rc;
++			rc = mdb_aggval_add(agg, &total, &one);
++			if (rc)
++				return rc;
++		}
++	} else {
++		return MDB_CORRUPTED;
++	}
++
++	*out = total;
++	return MDB_SUCCESS;
++}
++
++/** @defgroup aggregates Aggregate maintenance
++ *
++ * A put or delete on an aggregate DB changes one item: its contribution
++ * goes from \b before to \b after (#MDB_aggchange; zero for an absent
++ * item).  The item is the node at the cursor: a record of a plain DB, a
++ * whole dupset in a DUPSORT primary tree (a dupset counts as one key), one
++ * duplicate value in a duplicate tree.  The contributions are read from the
++ * final state of the node (#mdb_flat_leaf_item_agg()), before and after the
++ * operation.
++ *
++ * The unwind records how far up the tree changed structurally
++ * (#MDB_txn.mt_unwind_prefix).  When the operation is complete,
++ * #mdb_agg_settle() walks the cursor's path once, bottom-up:
++ *
++ *	- a link inside a structurally changed page gets the exact aggregate of
++ *	  its child, folded from that final page (#mdb_page_agg_local(): one
++ *	  page, never a subtree);
++ *	- a link in the untouched prefix gets the logical change;
++ *	- the DB totals (md_keys, md_hashsum) get the logical change once;
++ *	  md_entries stays LMDB's.
++ *
++ * Links that a structural step creates or moves off the cursor's path (the
++ * other half of a split, the sibling of a move) are made exact by that step
++ * when its pages are final.  Nothing is recomputed recursively.
++ * @{
++ */
++
++/** Settle the aggregates of a completed put or delete (see @ref aggregates).
++ * @param[in] mc the cursor of the operation, on its final path
++ * @param[in] ch the logical change of the item
++ */
++static int
++mdb_agg_settle(MDB_cursor *mc, const MDB_aggchange *ch)
++{
++	uint16_t agg = DB_AGGFLAGS(mc->mc_db), tot;
++	MDB_aggval v;
++	int prefix, i, rc;
++
++	if (!agg)
++		return MDB_SUCCESS;
++	prefix = (mc->mc_flags & C_SUB) ? mc->mc_txn->mt_unwind_sub_prefix :
++		mc->mc_txn->mt_unwind_prefix;
++	if (mc->mc_snum && (mc->mc_flags & C_INITIALIZED)) {
++		int top = mc->mc_top;
++		if (prefix > top)
++			prefix = top;
++		/* structurally changed levels: exact values from final pages */
++		for (i = top; i > prefix; i--) {
++			MDB_page *pp = mc->mc_pg[i-1];
++			if (!IS_BRANCH(pp) || !(pp->mp_flags & P_DIRTY) ||
++				mc->mc_ki[i-1] >= NUMKEYS(pp))
++				return MDB_PROBLEM;
++			rc = mdb_page_agg_local(mc, mc->mc_pg[i], &v);
++			if (rc)
++				return rc;
++			mdb_node_set_aggval(pp, NODEPTR(pp, mc->mc_ki[i-1]), &v);
++		}
++		/* the untouched prefix: the logical change */
++		for (i = prefix; i >= 1; i--) {
++			MDB_page *pp = mc->mc_pg[i-1];
++			MDB_node *node;
++			if (!IS_BRANCH(pp) || !(pp->mp_flags & P_DIRTY) ||
++				mc->mc_ki[i-1] >= NUMKEYS(pp))
++				return MDB_PROBLEM;
++			node = NODEPTR(pp, mc->mc_ki[i-1]);
++			mdb_node_get_aggval(pp, node, &v);
++			rc = mdb_aggval_apply_change(agg, &v, ch);
++			if (rc)
++				return rc;
++			mdb_node_set_aggval(pp, node, &v);
++		}
++	}
++	/* DB totals: md_entries is maintained by LMDB itself.  An inline
++	 * duplicate sub-page has no persistent totals of its own: the primary
++	 * leaf reads it directly. */
++	tot = agg & (MDB_AGG_KEYS|MDB_AGG_HASHSUM);
++	if (!tot)
++		return MDB_SUCCESS;
++	if ((mc->mc_flags & C_SUB) && mc->mc_snum && IS_SUBP(mc->mc_pg[0]))
++		return MDB_SUCCESS;
++	mdb_db_get_aggval(mc->mc_db, &v);
++	rc = mdb_aggval_apply_change(tot, &v, ch);
++	if (rc)
++		return rc;
++	if (tot & MDB_AGG_KEYS)
++		mc->mc_db->md_keys = (mdb_size_t)v.keys;
++	if (tot & MDB_AGG_HASHSUM)
++		memcpy(mc->mc_db->md_hashsum, v.hashsum, MDB_HASH_SIZE);
++	return MDB_SUCCESS;
++}
++
++/** The contribution of the item at the cursor (zero past the end) */
++static int
++mdb_agg_item_at(MDB_cursor *mc, MDB_aggval *out)
++{
++	MDB_page *mp;
++
++	mdb_aggval_zero(out);
++	if (!mc->mc_snum || !(mc->mc_flags & C_INITIALIZED))
++		return MDB_SUCCESS;
++	mp = mc->mc_pg[mc->mc_top];
++	if (mc->mc_ki[mc->mc_top] >= NUMKEYS(mp))
++		return MDB_SUCCESS;
++	return mdb_flat_leaf_item_agg(mc, mp, mc->mc_ki[mc->mc_top], out);
++}
++
++/** Validate the aggregate inputs of a put before anything changes: the hash
++ * slice must fit its source, and a value-source hashsum cannot be taken from
++ * #MDB_RESERVE storage, which the caller fills after the put.  LMDB does not
++ * support #MDB_RESERVE on DUPSORT databases: an aggregate DUPSORT DB refuses
++ * it explicitly.  #MDB_WRITEMAP needs no rule: put data are final at call
++ * time, and applications may not modify returned values.
++ */
++static int
++mdb_agg_put_check(MDB_cursor *mc, MDB_val *key, MDB_val *data,
++	unsigned int flags)
++{
++	uint16_t agg = DB_AGGFLAGS(mc->mc_db);
++	uint8_t slice[MDB_HASH_SIZE];
++	MDB_val *src;
++
++	if ((flags & MDB_RESERVE) && !(mc->mc_flags & C_SUB) &&
++		(mc->mc_db->md_flags & MDB_DUPSORT))
++		return MDB_INCOMPATIBLE;
++	if (!(agg & MDB_AGG_HASHSUM))
++		return MDB_SUCCESS;
++	if (mc->mc_flags & C_SUB) {
++		src = key;		/* the duplicate value is the key here */
++	} else if (mc->mc_db->md_flags & MDB_AGG_HASHSOURCE_FROM_KEY) {
++		src = key;
++	} else {
++		if (flags & MDB_RESERVE)
++			return MDB_INCOMPATIBLE;
++		src = data;		/* with MDB_MULTIPLE: the first item */
++	}
++	return mdb_agg_hash_slice(src, mc->mc_db->md_hash_offset, slice);
++}
++
++/** @} */
++
++/** The exact aggregate of a final page, as a branch link blob
++ * (see @ref aggregates) */
++static int
++mdb_agg_page_blob(MDB_cursor *mc, const MDB_page *mp, MDB_aggblob *out)
++{
++	MDB_aggval v;
++	int rc = mdb_page_agg_local(mc, mp, &v);
++	if (rc)
++		return rc;
++	mdb_aggval_to_blob(DB_AGGFLAGS(mc->mc_db), &v, out);
++	return MDB_SUCCESS;
++}
++
++/** Make link @p ki of branch page @p pp exact for its final child @p child */
++static int
++mdb_agg_link_exact(MDB_cursor *mc, MDB_page *pp, indx_t ki,
++	const MDB_page *child)
++{
++	MDB_aggblob b;
++	int rc;
++
++	if (!IS_BRANCH(pp) || ki >= NUMKEYS(pp) || !(pp->mp_flags & P_DIRTY) ||
++		NODEPGNO(NODEPTR(pp, ki)) != child->mp_pgno)
++		return MDB_PROBLEM;
++	if ((rc = mdb_agg_page_blob(mc, child, &b)))
++		return rc;
++	mdb_node_set_agg_blob(pp, NODEPTR(pp, ki), &b);
++	return MDB_SUCCESS;
++}
+diff --git ab/mdb_agg_query.c b/mdb_agg_query.c
+new file mode 100644
+index 0000000..32fda51
+--- /dev/null
++++ b/mdb_agg_query.c
+@@ -0,0 +1,1371 @@
++/* Aggregate query layer.
++ *
++ * This file is textually included by mdb.c after the aggregate
++ * maintenance/configuration helpers have been defined.  It intentionally uses
++ * LMDB-private cursor/page internals without exporting them through lmdb.h.
++ *
++ * Scope: totals, prefix/range, rank/select, and entry-rank cursor positioning.
++ * Window-relative range caching is part of this query layer.
++ */
++
++#define MDB_RANGE_ALLOWED_FLAGS (MDB_RANGE_LOWER_INCL|MDB_RANGE_UPPER_INCL)
++#define MDB_PREFIX_ALLOWED_FLAGS (MDB_AGG_PREFIX_INCL)
++
++static int
++mdb_agg_query_db(MDB_txn *txn, MDB_dbi dbi, MDB_db **dbp)
++{
++	int rc;
++
++	if (!txn || !dbp || !TXN_DBI_EXIST(txn, dbi, DB_USRVALID))
++		return EINVAL;
++	if (txn->mt_flags & MDB_TXN_BLOCKED)
++		return MDB_BAD_TXN;
++	if (txn->mt_dbflags[dbi] & DB_STALE) {
++		rc = mdb_dbi_refresh_stale_snapshot(txn, dbi);
++		if (rc)
++			return rc;
++	}
++	*dbp = &txn->mt_dbs[dbi];
++	return MDB_SUCCESS;
++}
++
++static void
++mdb_agg_query_zero_public(unsigned flags, MDB_agg *out)
++{
++	if (!out)
++		return;
++	out->mv_flags = flags;
++	out->mv_agg_entries = 0;
++	out->mv_agg_keys = 0;
++	memset(out->mv_agg_hashes, 0, MDB_HASH_SIZE);
++}
++
++static void
++mdb_agg_query_from_internal(uint16_t agg, unsigned schema,
++	const MDB_aggval *in, MDB_agg *out)
++{
++	mdb_agg_query_zero_public(schema, out);
++	if (!in)
++		return;
++	if (agg & MDB_AGG_ENTRIES)
++		out->mv_agg_entries = in->entries;
++	if (agg & MDB_AGG_KEYS)
++		out->mv_agg_keys = in->keys;
++	if (agg & MDB_AGG_HASHSUM)
++		memcpy(out->mv_agg_hashes, in->hashsum, MDB_HASH_SIZE);
++}
++
++static int
++mdb_agg_query_totals_internal(MDB_txn *txn, MDB_dbi dbi, MDB_aggval *out)
++{
++	MDB_db *db;
++	int rc;
++
++	if (!out)
++		return EINVAL;
++	rc = mdb_agg_query_db(txn, dbi, &db);
++	if (rc)
++		return rc;
++	if (!DB_AGGFLAGS(db))
++		return MDB_INCOMPATIBLE;
++	mdb_db_get_aggval(db, out);
++	return MDB_SUCCESS;
++}
++
++/* The totals of the tree of a cursor.  An inline duplicate sub-page has no
++ * persistent totals of its own (the sub-cursor's MDB_db carries only LMDB's
++ * md_entries): they are the fold of the sub-page, one page. */
++static int
++mdb_agg_query_cursor_totals(MDB_cursor *mc, MDB_aggval *out)
++{
++	if (!mc || !mc->mc_db || !out)
++		return EINVAL;
++	if (!DB_AGGFLAGS(mc->mc_db))
++		return MDB_INCOMPATIBLE;
++	if ((mc->mc_flags & C_SUB) && mc->mc_snum && mc->mc_pg[0] &&
++		IS_SUBP(mc->mc_pg[0]))
++		return mdb_dup_leaf_agg_local(mc, mc->mc_pg[0], 0, out);
++	mdb_db_get_aggval(mc->mc_db, out);
++	return MDB_SUCCESS;
++}
++
++static int
++mdb_agg_query_leaf_item(MDB_cursor *mc, MDB_page *mp, indx_t index,
++	MDB_aggval *out)
++{
++	if (!mc || !mp || !out || index >= NUMKEYS(mp))
++		return MDB_CORRUPTED;
++	if (mc->mc_flags & C_SUB)
++		return mdb_flat_leaf_item_agg(mc, mp, index, out);
++	if (!IS_LEAF(mp) || IS_LEAF2(mp))
++		return MDB_CORRUPTED;
++	return mdb_primary_leaf_node_agg(mc, mp, NODEPTR(mp, index), out);
++}
++
++
++static int
++mdb_agg_query_branch_weight(const MDB_page *mp, const MDB_node *node,
++	MDB_agg_weight weight, uint64_t *out)
++{
++	uint16_t agg;
++	const uint8_t *p;
++
++	if (!mp || !node || !out || !IS_BRANCH(mp))
++		return MDB_CORRUPTED;
++	agg = PAGE_AGGFLAGS(mp);
++	if (!(agg & (uint16_t)weight))
++		return MDB_INCOMPATIBLE;
++	p = (const uint8_t *)node->mn_data;
++	if (weight == MDB_AGG_WEIGHT_KEYS && (agg & MDB_AGG_ENTRIES))
++		p += MDB_AGG_U64_SIZE;
++	memcpy(out, p, sizeof(*out));
++	return MDB_SUCCESS;
++}
++
++static int
++mdb_agg_query_leaf_weight(MDB_cursor *mc, MDB_page *mp, indx_t index,
++	MDB_agg_weight weight, uint64_t *out)
++{
++	MDB_node *node;
++
++	if (!mc || !mp || !out || !IS_LEAF(mp) || index >= NUMKEYS(mp))
++		return MDB_CORRUPTED;
++	if (weight == MDB_AGG_WEIGHT_KEYS) {
++		*out = 1;
++		return MDB_SUCCESS;
++	}
++	if ((mc->mc_flags & C_SUB) || !(mc->mc_db->md_flags & MDB_DUPSORT)) {
++		*out = 1;
++		return MDB_SUCCESS;
++	}
++	if (IS_LEAF2(mp))
++		return MDB_CORRUPTED;
++	node = NODEPTR(mp, index);
++	if (!(node->mn_flags & F_DUPDATA)) {
++		*out = 1;
++		return MDB_SUCCESS;
++	}
++	if (node->mn_flags & F_SUBDATA) {
++		MDB_db dupdb;
++		if (NODEDSZ(node) != sizeof(MDB_db))
++			return MDB_CORRUPTED;
++		memcpy(&dupdb, NODEDATA(node), sizeof(dupdb));
++		if (dupdb.md_entries == 0)
++			return MDB_CORRUPTED;
++		*out = (uint64_t)dupdb.md_entries;
++		return MDB_SUCCESS;
++	}
++	{
++		MDB_page *subp = NODEDATA(node);
++		if (NODEDSZ(node) < PAGEHDRSZ || !IS_SUBP(subp) || NUMKEYS(subp) == 0)
++			return MDB_CORRUPTED;
++		*out = NUMKEYS(subp);
++	}
++	return MDB_SUCCESS;
++}
++
++static int
++mdb_agg_query_add_value_inplace(uint16_t agg, MDB_aggval *dst,
++	const MDB_aggval *src)
++{
++	if ((agg & MDB_AGG_ENTRIES) && UINT64_MAX - dst->entries < src->entries)
++		return MDB_CORRUPTED;
++	if ((agg & MDB_AGG_KEYS) && UINT64_MAX - dst->keys < src->keys)
++		return MDB_CORRUPTED;
++	if (agg & MDB_AGG_ENTRIES) dst->entries += src->entries;
++	if (agg & MDB_AGG_KEYS) dst->keys += src->keys;
++	if (agg & MDB_AGG_HASHSUM) mdb_agg_hash_add(dst->hashsum, src->hashsum);
++	return MDB_SUCCESS;
++}
++
++static int
++mdb_agg_query_add_branch_prefix(MDB_cursor *mc, MDB_page *mp, indx_t index,
++	MDB_aggval *out)
++{
++	MDB_node *node;
++	const uint8_t *p;
++	uint64_t v;
++	uint16_t agg;
++
++	if (!mc || !mp || !out || !IS_BRANCH(mp) || index >= NUMKEYS(mp))
++		return MDB_CORRUPTED;
++	agg = DB_AGGFLAGS(mc->mc_db);
++	if (PAGE_AGGFLAGS(mp) != agg)
++		return MDB_CORRUPTED;
++	node = NODEPTR(mp, index);
++	p = (const uint8_t *)node->mn_data;
++	if (agg & MDB_AGG_ENTRIES) {
++		memcpy(&v, p, sizeof(v)); p += sizeof(v);
++		if (UINT64_MAX - out->entries < v) return MDB_CORRUPTED;
++		out->entries += v;
++	}
++	if (agg & MDB_AGG_KEYS) {
++		memcpy(&v, p, sizeof(v)); p += sizeof(v);
++		if (UINT64_MAX - out->keys < v) return MDB_CORRUPTED;
++		out->keys += v;
++	}
++	if (agg & MDB_AGG_HASHSUM)
++		mdb_agg_hash_add(out->hashsum, p);
++	return MDB_SUCCESS;
++}
++
++/* Position at the first key >= *key (MDB_SET_RANGE semantics) and report
++ * whether the key found equals the requested one.
++ *
++ * mdb_cursor_set() treats a non-NULL exactp as an exact-match request (MDB_SET
++ * semantics): for any absent key it returns MDB_NOTFOUND even though the
++ * cursor is already positioned on the next greater key.  The public
++ * mdb_cursor_get() therefore passes NULL for MDB_SET_RANGE, and so must we;
++ * exactness is derived afterwards with the cursor's own comparator, which is
++ * the duplicate comparator on a duplicate subcursor (C5). */
++static int
++mdb_agg_query_set_range(MDB_cursor *mc, MDB_val *key, MDB_val *data,
++	int *exactp)
++{
++	MDB_val requested = *key;
++	int rc = mdb_cursor_set(mc, key, data, MDB_SET_RANGE, NULL);
++
++	*exactp = rc == MDB_SUCCESS && mc->mc_dbx->md_cmp(&requested, key) == 0;
++	return rc;
++}
++
++/* Aggregate all keys before key, or through key when incl is set and key exists.
++ * Works both on a primary tree and on an initialized duplicate subcursor. */
++static int
++mdb_agg_query_prefix_key_cursor(MDB_cursor *cur, const MDB_val *key,
++	unsigned incl, MDB_aggval *out, int *any_out)
++{
++	MDB_db *db;
++	MDB_val k, v;
++	MDB_aggval total, one;
++	uint16_t agg;
++	int exact = 0, rc;
++	indx_t lvl;
++
++	if (any_out)
++		*any_out = 0;
++	if (!cur || !key || !out || !cur->mc_db)
++		return EINVAL;
++	if (cur->mc_txn->mt_flags & MDB_TXN_BLOCKED)
++		return MDB_BAD_TXN;
++
++	db = cur->mc_db;
++	agg = DB_AGGFLAGS(db);
++	if (!agg)
++		return MDB_INCOMPATIBLE;
++	mdb_aggval_zero(&total);
++
++	k = *key;
++	v.mv_size = 0;
++	v.mv_data = NULL;
++	rc = mdb_agg_query_set_range(cur, &k, &v, &exact);
++	if (rc == MDB_NOTFOUND) {
++		rc = mdb_agg_query_cursor_totals(cur, &total);
++		if (!rc && any_out)
++			*any_out = db->md_entries != 0;
++		if (!rc)
++			*out = total;
++		return rc;
++	}
++	if (rc)
++		return rc;
++
++	/* Fully covered subtrees to the left of the search path. */
++	for (lvl = 0; lvl < cur->mc_top; ++lvl) {
++		MDB_page *pp = cur->mc_pg[lvl];
++		indx_t j, stop = cur->mc_ki[lvl];
++		if (!pp || !IS_BRANCH(pp) || PAGE_AGGFLAGS(pp) != agg)
++			return MDB_CORRUPTED;
++		for (j = 0; j < stop; ++j) {
++			rc = mdb_agg_query_add_branch_prefix(cur, pp, j, &total);
++			if (rc)
++				return rc;
++		}
++	}
++
++	/* The boundary leaf contributes only its local prefix. */
++	{
++		MDB_page *lp = cur->mc_pg[cur->mc_top];
++		indx_t i, stop = cur->mc_ki[cur->mc_top];
++		indx_t limit = stop + ((incl && exact && stop < NUMKEYS(lp)) ? 1 : 0);
++		int any = limit != 0;
++
++		if (!lp || !IS_LEAF(lp))
++			return MDB_CORRUPTED;
++		for (i = 0; i < limit; ++i) {
++			rc = mdb_agg_query_leaf_item(cur, lp, i, &one);
++			if (rc)
++				return rc;
++			rc = mdb_agg_query_add_value_inplace(agg, &total, &one);
++			if (rc)
++				return rc;
++		}
++		if (!any) {
++			for (lvl = 0; lvl < cur->mc_top; ++lvl) {
++				if (cur->mc_ki[lvl] != 0) {
++					any = 1;
++					break;
++				}
++			}
++		}
++		if (any_out)
++			*any_out = any;
++	}
++
++	*out = total;
++	return MDB_SUCCESS;
++}
++
++static int
++mdb_agg_query_prefix_key_internal(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *key, unsigned incl, MDB_aggval *out)
++{
++	MDB_cursor *cur = NULL;
++	int rc;
++
++	if (!key || !out)
++		return EINVAL;
++	rc = mdb_cursor_open(txn, dbi, &cur);
++	if (rc)
++		return rc;
++	rc = mdb_agg_query_prefix_key_cursor(cur, key, incl, out, NULL);
++	mdb_cursor_close(cur);
++	return rc;
++}
++
++/* Record-order prefix for DUPSORT.  The primary-key prefix is followed by the
++ * requested portion of the duplicate set. */
++static int
++mdb_agg_query_prefix_kd_internal(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *key, const MDB_val *data, unsigned incl, MDB_aggval *out)
++{
++	MDB_db *db;
++	MDB_cursor *mc = NULL;
++	MDB_page *lp;
++	MDB_node *node;
++	MDB_val ck, cv;
++	MDB_aggval part;
++	uint16_t agg;
++	int rc;
++
++	if (!key || !out)
++		return EINVAL;
++	rc = mdb_agg_query_db(txn, dbi, &db);
++	if (rc)
++		return rc;
++	agg = DB_AGGFLAGS(db);
++	if (!agg)
++		return MDB_INCOMPATIBLE;
++	if (!data || !(db->md_flags & MDB_DUPSORT))
++		return mdb_agg_query_prefix_key_internal(txn, dbi, key, incl, out);
++
++	rc = mdb_cursor_open(txn, dbi, &mc);
++	if (rc)
++		return rc;
++
++	/* Base contribution: all primary keys strictly before key. */
++	rc = mdb_agg_query_prefix_key_cursor(mc, key, 0, out, NULL);
++	if (rc)
++		goto done;
++
++	ck.mv_size = cv.mv_size = 0;
++	ck.mv_data = cv.mv_data = NULL;
++	rc = mdb_cursor_get(mc, &ck, &cv, MDB_GET_CURRENT);
++	if (rc == MDB_NOTFOUND) {
++		rc = MDB_SUCCESS;
++		goto done;
++	}
++	if (rc)
++		goto done;
++	if (mdb_cmp(txn, dbi, &ck, key) != 0) {
++		rc = MDB_SUCCESS;
++		goto done;
++	}
++
++	lp = mc->mc_pg[mc->mc_top];
++	if (!lp || !IS_LEAF(lp) || IS_LEAF2(lp)) {
++		rc = MDB_CORRUPTED;
++		goto done;
++	}
++	node = NODEPTR(lp, mc->mc_ki[mc->mc_top]);
++
++	if (node->mn_flags & F_DUPDATA) {
++		MDB_val dk = *data;
++		int any = 0;
++
++		if (!mc->mc_xcursor) {
++			rc = MDB_PROBLEM;
++			goto done;
++		}
++		rc = mdb_xcursor_init1(mc, node);
++		if (rc)
++			goto done;
++		rc = mdb_agg_query_prefix_key_cursor(&mc->mc_xcursor->mx_cursor,
++			&dk, incl, &part, &any);
++		if (rc)
++			goto done;
++
++		/* The duplicate tree counts every value as a key; the primary tree
++		 * exposes the touched dupset as exactly one distinct primary key. */
++		if (agg & MDB_AGG_KEYS)
++			part.keys = any ? 1 : 0;
++		rc = mdb_aggval_add(agg, out, &part);
++	} else {
++		MDB_val actual;
++		int cmp;
++
++		rc = mdb_node_read(mc, node, &actual);
++		if (rc)
++			goto done;
++		cmp = mdb_dcmp(txn, dbi, &actual, data);
++		if (cmp < 0 || (incl && cmp == 0)) {
++			rc = mdb_primary_leaf_node_agg(mc, lp, node, &part);
++			if (!rc)
++				rc = mdb_aggval_add(agg, out, &part);
++		}
++	}
++
++done:
++	mdb_cursor_close(mc);
++	return rc;
++}
++
++/* Number of elements preceding the current cursor position in the requested
++ * aggregate weight. */
++static int
++mdb_agg_query_cursor_rank_base(MDB_cursor *mc, MDB_agg_weight weight,
++	uint64_t *out)
++{
++	uint64_t rank = 0, add;
++	uint16_t agg, wflag;
++	int lvl, rc;
++	indx_t j;
++
++	if (!mc || !out || !(mc->mc_flags & C_INITIALIZED))
++		return EINVAL;
++	agg = DB_AGGFLAGS(mc->mc_db);
++	wflag = (uint16_t)weight;
++	if (!agg || !(agg & wflag))
++		return MDB_INCOMPATIBLE;
++
++	for (lvl = 0; lvl < (int)mc->mc_top; ++lvl) {
++		MDB_page *pp = mc->mc_pg[lvl];
++		indx_t ix = mc->mc_ki[lvl];
++		if (!pp || !IS_BRANCH(pp) || PAGE_AGGFLAGS(pp) != agg)
++			return MDB_CORRUPTED;
++		for (j = 0; j < ix; ++j) {
++			rc = mdb_agg_query_branch_weight(pp, NODEPTR(pp, j), weight, &add);
++			if (rc)
++				return rc;
++			if (UINT64_MAX - rank < add)
++				return MDB_CORRUPTED;
++			rank += add;
++		}
++	}
++
++	{
++		MDB_page *lp = mc->mc_pg[mc->mc_top];
++		indx_t ix = mc->mc_ki[mc->mc_top];
++		if (!lp || !IS_LEAF(lp))
++			return MDB_CORRUPTED;
++		for (j = 0; j < ix; ++j) {
++			rc = mdb_agg_query_leaf_weight(mc, lp, j, weight, &add);
++			if (rc)
++				return rc;
++			if (UINT64_MAX - rank < add)
++				return MDB_CORRUPTED;
++			rank += add;
++		}
++	}
++
++	*out = rank;
++	return MDB_SUCCESS;
++}
++
++/* Locate the primary/flat leaf item containing rank.  For an entry-weight
++ * DUPSORT primary query, dup_index receives the offset inside that dupset. */
++static int
++mdb_agg_query_cursor_rank_search(MDB_cursor *mc, MDB_agg_weight weight,
++	uint64_t rank, uint64_t *dup_index)
++{
++	MDB_page *mp;
++	uint64_t remaining = rank, total, cnt;
++	uint16_t agg, wflag;
++	int rc;
++
++	if (!mc || !mc->mc_db)
++		return EINVAL;
++	if (mc->mc_txn->mt_flags & MDB_TXN_BLOCKED)
++		return MDB_BAD_TXN;
++	agg = DB_AGGFLAGS(mc->mc_db);
++	wflag = (uint16_t)weight;
++	if (!agg || !(agg & wflag))
++		return MDB_INCOMPATIBLE;
++	if (mc->mc_db->md_root == P_INVALID)
++		return MDB_NOTFOUND;
++
++	if (weight == MDB_AGG_WEIGHT_ENTRIES) {
++		total = (uint64_t)mc->mc_db->md_entries;
++	} else {
++		MDB_aggval t;
++		rc = mdb_agg_query_cursor_totals(mc, &t);
++		if (rc)
++			return rc;
++		total = t.keys;
++	}
++	if (rank >= total)
++		return MDB_NOTFOUND;
++
++	MDB_CURSOR_UNREF(mc, 0);
++	mc->mc_flags &= ~(C_INITIALIZED|C_EOF);
++	mc->mc_top = 0;
++	mc->mc_snum = 0;
++	rc = mdb_page_search(mc, NULL, MDB_PS_ROOTONLY);
++	if (rc)
++		return rc;
++	mp = mc->mc_pg[mc->mc_top];
++
++	while (IS_BRANCH(mp)) {
++		indx_t i, n = NUMKEYS(mp);
++		MDB_node *node = NULL;
++		if (PAGE_AGGFLAGS(mp) != agg)
++			return MDB_CORRUPTED;
++		for (i = 0; i < n; ++i) {
++			rc = mdb_agg_query_branch_weight(mp, NODEPTR(mp, i), weight, &cnt);
++			if (rc)
++				return rc;
++			if (remaining < cnt)
++				break;
++			remaining -= cnt;
++		}
++		if (i == n)
++			return MDB_CORRUPTED;
++		mc->mc_ki[mc->mc_top] = i;
++		node = NODEPTR(mp, i);
++		rc = mdb_page_get(mc, NODEPGNO(node), &mp, NULL);
++		if (rc)
++			return rc;
++		rc = mdb_cursor_push(mc, mp);
++		if (rc)
++			return rc;
++	}
++
++	if (!IS_LEAF(mp))
++		return MDB_CORRUPTED;
++	{
++		indx_t i, n = NUMKEYS(mp);
++		for (i = 0; i < n; ++i) {
++			rc = mdb_agg_query_leaf_weight(mc, mp, i, weight, &cnt);
++			if (rc)
++				return rc;
++			if (remaining < cnt)
++				break;
++			remaining -= cnt;
++		}
++		if (i == n)
++			return MDB_CORRUPTED;
++		mc->mc_ki[mc->mc_top] = i;
++	}
++	if (dup_index)
++		*dup_index = (weight == MDB_AGG_WEIGHT_ENTRIES &&
++			!(mc->mc_flags & C_SUB) && (mc->mc_db->md_flags & MDB_DUPSORT)) ?
++			remaining : 0;
++	mc->mc_flags |= C_INITIALIZED;
++	return MDB_SUCCESS;
++}
++
++/* Locate the first and last record of a record-order DUPSORT range, then use
++ * key ranks to obtain the number of distinct primary keys touched. */
++static int
++mdb_agg_query_range_kd_keys(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *low_key, const MDB_val *low_data, unsigned lower_incl,
++	const MDB_val *high_key, const MDB_val *high_data, unsigned upper_incl,
++	uint64_t *out_keys)
++{
++	MDB_cursor *mc = NULL;
++	MDB_val ks, ds, kl, dl;
++	uint64_t first_rank, last_rank;
++	int rc = MDB_SUCCESS, exact = 0;
++	int have_start = 0, have_last = 0;
++
++	if (!txn || !out_keys)
++		return EINVAL;
++	*out_keys = 0;
++
++	if (low_key && high_key) {
++		int kc = mdb_cmp(txn, dbi, low_key, high_key);
++		if (kc > 0)
++			return MDB_SUCCESS;
++		if (kc == 0 && low_data && high_data &&
++			mdb_dcmp(txn, dbi, low_data, high_data) > 0)
++			return MDB_SUCCESS;
++	}
++
++	rc = mdb_cursor_open(txn, dbi, &mc);
++	if (rc)
++		return rc;
++
++	/* First record in range. */
++	{
++		MDB_val k = {0}, d = {0};
++		if (!low_key) {
++			rc = mdb_cursor_get(mc, &k, &d, MDB_FIRST);
++			if (!rc) { ks = k; ds = d; have_start = 1; }
++		} else if (low_data) {
++			MDB_val requested = *low_data;
++			k = *low_key; d = *low_data;
++			rc = mdb_cursor_set(mc, &k, &d, MDB_GET_BOTH_RANGE, &exact);
++			if (rc == MDB_NOTFOUND) {
++				MDB_val kt = *low_key, dt = {0, NULL};
++				int exactk = 0;
++				rc = mdb_agg_query_set_range(mc, &kt, &dt, &exactk);
++				if (!rc && exactk)
++					rc = mdb_cursor_get(mc, &kt, &dt, MDB_NEXT_NODUP);
++				if (!rc) { ks = kt; ds = dt; have_start = 1; }
++			} else if (!rc) {
++				int deq = mdb_dcmp(txn, dbi, &requested, &d) == 0;
++				if (!lower_incl && deq)
++					rc = mdb_cursor_get(mc, &k, &d, MDB_NEXT);
++				if (!rc) { ks = k; ds = d; have_start = 1; }
++			}
++		} else {
++			k = *low_key;
++			rc = mdb_agg_query_set_range(mc, &k, &d, &exact);
++			if (!rc && !lower_incl && exact)
++				rc = mdb_cursor_get(mc, &k, &d, MDB_NEXT_NODUP);
++			if (!rc) { ks = k; ds = d; have_start = 1; }
++		}
++		if (rc == MDB_NOTFOUND)
++			rc = MDB_SUCCESS;
++	}
++	if (rc || !have_start)
++		goto done;
++
++	/* Save the distinct-key rank of the first touched key. */
++	rc = mdb_agg_query_cursor_rank_base(mc, MDB_AGG_WEIGHT_KEYS, &first_rank);
++	if (rc)
++		goto done;
++
++	/* First record strictly after the upper bound; PREV gives last in range. */
++	{
++		MDB_val k = {0}, d = {0};
++		int after_last = 0;
++
++		if (!high_key) {
++			after_last = 1;
++		} else if (high_data) {
++			MDB_val requested = *high_data;
++			k = *high_key; d = *high_data;
++			rc = mdb_cursor_set(mc, &k, &d, MDB_GET_BOTH_RANGE, &exact);
++			if (rc == MDB_NOTFOUND) {
++				MDB_val kt = *high_key, dt = {0, NULL};
++				int exactk = 0;
++				rc = mdb_agg_query_set_range(mc, &kt, &dt, &exactk);
++				if (rc == MDB_NOTFOUND) { after_last = 1; rc = MDB_SUCCESS; }
++				else if (!rc && exactk) {
++					rc = mdb_cursor_get(mc, &kt, &dt, MDB_NEXT_NODUP);
++					if (rc == MDB_NOTFOUND) { after_last = 1; rc = MDB_SUCCESS; }
++				}
++			} else if (!rc && upper_incl &&
++				mdb_dcmp(txn, dbi, &requested, &d) == 0) {
++				rc = mdb_cursor_get(mc, &k, &d, MDB_NEXT);
++				if (rc == MDB_NOTFOUND) { after_last = 1; rc = MDB_SUCCESS; }
++			}
++		} else {
++			k = *high_key;
++			rc = mdb_agg_query_set_range(mc, &k, &d, &exact);
++			if (rc == MDB_NOTFOUND) { after_last = 1; rc = MDB_SUCCESS; }
++			else if (!rc && upper_incl && exact) {
++				rc = mdb_cursor_get(mc, &k, &d, MDB_NEXT_NODUP);
++				if (rc == MDB_NOTFOUND) { after_last = 1; rc = MDB_SUCCESS; }
++			}
++		}
++		if (rc)
++			goto done;
++		if (after_last)
++			rc = mdb_cursor_get(mc, &k, &d, MDB_LAST);
++		else
++			rc = mdb_cursor_get(mc, &k, &d, MDB_PREV);
++		if (!rc) { kl = k; dl = d; have_last = 1; }
++		else if (rc == MDB_NOTFOUND) rc = MDB_SUCCESS;
++	}
++	if (rc || !have_last)
++		goto done;
++
++	/* The located record interval must be nonempty in record order. */
++	{
++		int kc = mdb_cmp(txn, dbi, &ks, &kl);
++		if (kc > 0 || (kc == 0 && mdb_dcmp(txn, dbi, &ds, &dl) > 0))
++			goto done;
++	}
++
++	/* Reposition to the last record and obtain its distinct-key rank. */
++	{
++		MDB_val k = kl, d = dl;
++		rc = mdb_cursor_get(mc, &k, &d, MDB_GET_BOTH);
++		if (rc)
++			goto done;
++	}
++	rc = mdb_agg_query_cursor_rank_base(mc, MDB_AGG_WEIGHT_KEYS, &last_rank);
++	if (rc)
++		goto done;
++	if (last_rank < first_rank) {
++		rc = MDB_CORRUPTED;
++		goto done;
++	}
++	*out_keys = last_rank - first_rank + 1;
++
++done:
++	mdb_cursor_close(mc);
++	return rc;
++}
++
++static int
++mdb_agg_query_select_cursor(MDB_cursor *mc, MDB_agg_weight weight,
++	uint64_t rank, MDB_val *key, MDB_val *data, uint64_t *dup_index_out)
++{
++	MDB_page *mp;
++	MDB_node *node;
++	MDB_val dk, dd;
++	uint64_t dup_index = 0;
++	int rc;
++
++	if (!mc || !key || !data)
++		return EINVAL;
++	rc = mdb_agg_query_cursor_rank_search(mc, weight, rank, &dup_index);
++	if (rc)
++		return rc;
++
++	mp = mc->mc_pg[mc->mc_top];
++	if (!(mc->mc_flags & C_SUB) && !IS_LEAF2(mp) &&
++		(mc->mc_db->md_flags & MDB_DUPSORT)) {
++		node = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
++		if (node->mn_flags & F_DUPDATA) {
++			rc = mdb_xcursor_init1(mc, node);
++			if (rc)
++				return rc;
++			dk.mv_size = dd.mv_size = 0;
++			dk.mv_data = dd.mv_data = NULL;
++			rc = mdb_cursor_get(&mc->mc_xcursor->mx_cursor, &dk, &dd, MDB_FIRST);
++			if (rc)
++				return rc;
++			if (weight == MDB_AGG_WEIGHT_ENTRIES && dup_index) {
++				rc = mdb_agg_query_cursor_rank_search(&mc->mc_xcursor->mx_cursor,
++					MDB_AGG_WEIGHT_ENTRIES, dup_index, NULL);
++				if (rc)
++					return rc;
++			}
++		}
++	}
++	if (dup_index_out)
++		*dup_index_out = weight == MDB_AGG_WEIGHT_ENTRIES ? dup_index : 0;
++	return mdb_cursor_get(mc, key, data, MDB_GET_CURRENT);
++}
++
++int ESECT
++mdb_agg_totals(MDB_txn *txn, MDB_dbi dbi, MDB_agg *out)
++{
++	MDB_db *db;
++	MDB_aggval total;
++	uint16_t agg;
++	int rc;
++
++	if (!out)
++		return EINVAL;
++	rc = mdb_agg_query_db(txn, dbi, &db);
++	if (rc)
++		return rc;
++	agg = DB_AGGFLAGS(db);
++	if (!agg)
++		return MDB_INCOMPATIBLE;
++	mdb_db_get_aggval(db, &total);
++	mdb_agg_query_from_internal(agg, DB_AGGSCHEMAFLAGS(db), &total, out);
++	return MDB_SUCCESS;
++}
++
++int ESECT
++mdb_agg_prefix(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *key, const MDB_val *data, unsigned flags, MDB_agg *out)
++{
++	MDB_db *db;
++	MDB_aggval a;
++	uint16_t agg;
++	int rc;
++
++	if (!key || !out || (flags & ~MDB_PREFIX_ALLOWED_FLAGS))
++		return EINVAL;
++	rc = mdb_agg_query_db(txn, dbi, &db);
++	if (rc)
++		return rc;
++	agg = DB_AGGFLAGS(db);
++	if (!agg)
++		return MDB_INCOMPATIBLE;
++	rc = mdb_agg_query_prefix_kd_internal(txn, dbi, key, data,
++		!!(flags & MDB_AGG_PREFIX_INCL), &a);
++	if (rc)
++		return rc;
++	mdb_agg_query_from_internal(agg, DB_AGGSCHEMAFLAGS(db), &a, out);
++	return MDB_SUCCESS;
++}
++
++static int
++mdb_agg_query_range_key(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *low, const MDB_val *high, unsigned flags, MDB_agg *out)
++{
++	MDB_db *db;
++	MDB_aggval hi, lo, result;
++	uint16_t agg;
++	unsigned lower_incl = !!(flags & MDB_RANGE_LOWER_INCL);
++	unsigned upper_incl = !!(flags & MDB_RANGE_UPPER_INCL);
++	int rc;
++
++	rc = mdb_agg_query_db(txn, dbi, &db);
++	if (rc)
++		return rc;
++	agg = DB_AGGFLAGS(db);
++	if (!agg)
++		return MDB_INCOMPATIBLE;
++	if (low && high) {
++		int cmp = mdb_cmp(txn, dbi, low, high);
++		if (cmp > 0 || (cmp == 0 && !(lower_incl && upper_incl))) {
++			mdb_agg_query_zero_public(DB_AGGSCHEMAFLAGS(db), out);
++			return MDB_SUCCESS;
++		}
++	}
++
++	if (!high)
++		rc = mdb_agg_query_totals_internal(txn, dbi, &hi);
++	else
++		rc = mdb_agg_query_prefix_key_internal(txn, dbi, high, upper_incl, &hi);
++	if (rc)
++		return rc;
++	if (!low)
++		mdb_aggval_zero(&lo);
++	else {
++		rc = mdb_agg_query_prefix_key_internal(txn, dbi, low, !lower_incl, &lo);
++		if (rc)
++			return rc;
++	}
++	result = hi;
++	rc = mdb_aggval_sub(agg, &result, &lo);
++	if (rc)
++		return rc;
++	mdb_agg_query_from_internal(agg, DB_AGGSCHEMAFLAGS(db), &result, out);
++	return MDB_SUCCESS;
++}
++
++int ESECT
++mdb_agg_range(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *low_key, const MDB_val *low_data,
++	const MDB_val *high_key, const MDB_val *high_data,
++	unsigned flags, MDB_agg *out)
++{
++	MDB_db *db;
++	MDB_aggval hi, lo, result;
++	uint16_t agg, diffmask;
++	unsigned lower_incl, upper_incl;
++	int rc;
++
++	if (!out || (flags & ~MDB_RANGE_ALLOWED_FLAGS))
++		return EINVAL;
++	rc = mdb_agg_query_db(txn, dbi, &db);
++	if (rc)
++		return rc;
++	agg = DB_AGGFLAGS(db);
++	if (!agg)
++		return MDB_INCOMPATIBLE;
++	if (!(db->md_flags & MDB_DUPSORT) || (!low_data && !high_data))
++		return mdb_agg_query_range_key(txn, dbi, low_key, high_key, flags, out);
++
++	lower_incl = !!(flags & MDB_RANGE_LOWER_INCL);
++	upper_incl = !!(flags & MDB_RANGE_UPPER_INCL);
++	if (low_key && high_key) {
++		int kc = mdb_cmp(txn, dbi, low_key, high_key);
++		if (kc > 0 || (kc == 0 && low_data && high_data &&
++			mdb_dcmp(txn, dbi, low_data, high_data) > 0)) {
++			mdb_agg_query_zero_public(DB_AGGSCHEMAFLAGS(db), out);
++			return MDB_SUCCESS;
++		}
++	}
++
++	if (!high_key)
++		rc = mdb_agg_query_totals_internal(txn, dbi, &hi);
++	else if (high_data)
++		rc = mdb_agg_query_prefix_kd_internal(txn, dbi, high_key, high_data,
++			upper_incl, &hi);
++	else
++		rc = mdb_agg_query_prefix_key_internal(txn, dbi, high_key, upper_incl, &hi);
++	if (rc)
++		return rc;
++
++	if (!low_key)
++		mdb_aggval_zero(&lo);
++	else if (low_data)
++		rc = mdb_agg_query_prefix_kd_internal(txn, dbi, low_key, low_data,
++			!lower_incl, &lo);
++	else
++		rc = mdb_agg_query_prefix_key_internal(txn, dbi, low_key, !lower_incl, &lo);
++	if (rc)
++		return rc;
++
++	/* Prefix-difference is exact for ENTRIES and HASHSUM.  KEYS is computed
++	 * separately because a bound may cut through a duplicate set. */
++	result = hi;
++	diffmask = agg & (MDB_AGG_ENTRIES|MDB_AGG_HASHSUM);
++	rc = mdb_aggval_sub(diffmask, &result, &lo);
++	if (rc) {
++		mdb_agg_query_zero_public(DB_AGGSCHEMAFLAGS(db), out);
++		return MDB_SUCCESS;
++	}
++	if (agg & MDB_AGG_KEYS) {
++		rc = mdb_agg_query_range_kd_keys(txn, dbi,
++			low_key, low_data, lower_incl,
++			high_key, high_data, upper_incl, &result.keys);
++		if (rc)
++			return rc;
++	}
++	mdb_agg_query_from_internal(agg, DB_AGGSCHEMAFLAGS(db), &result, out);
++	return MDB_SUCCESS;
++}
++
++int ESECT
++mdb_agg_select(MDB_txn *txn, MDB_dbi dbi, MDB_agg_weight weight,
++	uint64_t rank, MDB_val *key, MDB_val *data, uint64_t *dup_index)
++{
++	MDB_db *db;
++	MDB_cursor *mc = NULL;
++	uint16_t wflag = (uint16_t)weight;
++	int rc;
++
++	if (!key || !data || (weight != MDB_AGG_WEIGHT_ENTRIES &&
++		weight != MDB_AGG_WEIGHT_KEYS))
++		return EINVAL;
++	rc = mdb_agg_query_db(txn, dbi, &db);
++	if (rc)
++		return rc;
++	if (!(DB_AGGFLAGS(db) & wflag))
++		return MDB_INCOMPATIBLE;
++	rc = mdb_cursor_open(txn, dbi, &mc);
++	if (rc)
++		return rc;
++	rc = mdb_agg_query_select_cursor(mc, weight, rank, key, data, dup_index);
++	mdb_cursor_close(mc);
++	return rc;
++}
++
++int ESECT
++mdb_agg_cursor_seek_rank(MDB_cursor *mc, uint64_t rank,
++	MDB_val *key, MDB_val *data)
++{
++	MDB_val kd = {0, NULL}, dd = {0, NULL};
++	return mdb_agg_query_select_cursor(mc, MDB_AGG_WEIGHT_ENTRIES, rank,
++		key ? key : &kd, data ? data : &dd, NULL);
++}
++
++int ESECT
++mdb_agg_rank(MDB_txn *txn, MDB_dbi dbi,
++	MDB_val *key, MDB_val *data, MDB_agg_weight weight,
++	unsigned flags, uint64_t *rank, uint64_t *dup_index)
++{
++	MDB_db *db;
++	MDB_cursor *mc = NULL;
++	MDB_val k, d;
++	uint64_t base = 0, dup = 0;
++	uint16_t wflag = (uint16_t)weight;
++	int rc;
++
++	if (!key || !data || !rank ||
++		(weight != MDB_AGG_WEIGHT_ENTRIES && weight != MDB_AGG_WEIGHT_KEYS) ||
++		(flags != MDB_AGG_RANK_EXACT && flags != MDB_AGG_RANK_SET_RANGE))
++		return EINVAL;
++	rc = mdb_agg_query_db(txn, dbi, &db);
++	if (rc)
++		return rc;
++	if (!(DB_AGGFLAGS(db) & wflag))
++		return MDB_INCOMPATIBLE;
++	if (weight == MDB_AGG_WEIGHT_KEYS && (data->mv_size || data->mv_data))
++		return EINVAL;
++	if (!(db->md_flags & MDB_DUPSORT) && (data->mv_size || data->mv_data))
++		return EINVAL;
++
++	rc = mdb_cursor_open(txn, dbi, &mc);
++	if (rc)
++		return rc;
++	k = *key;
++	d = *data;
++
++	if ((db->md_flags & MDB_DUPSORT) && weight == MDB_AGG_WEIGHT_ENTRIES) {
++		int data_unspecified = d.mv_size == 0 && d.mv_data == NULL;
++		if (flags == MDB_AGG_RANK_EXACT) {
++			if (data_unspecified) { rc = EINVAL; goto done; }
++			rc = mdb_cursor_get(mc, &k, &d, MDB_GET_BOTH);
++		} else if (data_unspecified) {
++			rc = mdb_cursor_get(mc, &k, &d, MDB_SET_RANGE);
++		} else {
++			MDB_val kin = k;
++			rc = mdb_cursor_get(mc, &k, &d, MDB_GET_BOTH_RANGE);
++			if (rc == MDB_NOTFOUND) {
++				k = kin; d.mv_size = 0; d.mv_data = NULL;
++				rc = mdb_cursor_get(mc, &k, &d, MDB_SET_RANGE);
++				if (!rc && mdb_cmp(txn, dbi, &k, &kin) == 0)
++					rc = mdb_cursor_get(mc, &k, &d, MDB_NEXT_NODUP);
++			}
++		}
++	} else {
++		rc = mdb_cursor_get(mc, &k, &d,
++			flags == MDB_AGG_RANK_SET_RANGE ? MDB_SET_RANGE : MDB_SET_KEY);
++	}
++	if (rc)
++		goto done;
++
++	*key = k;
++	*data = d;
++	rc = mdb_agg_query_cursor_rank_base(mc, weight, &base);
++	if (rc)
++		goto done;
++
++	if (weight == MDB_AGG_WEIGHT_ENTRIES && (db->md_flags & MDB_DUPSORT)) {
++		MDB_page *mp = mc->mc_pg[mc->mc_top];
++		if (!IS_LEAF2(mp)) {
++			MDB_node *node = NODEPTR(mp, mc->mc_ki[mc->mc_top]);
++			if (node->mn_flags & F_DUPDATA) {
++				MDB_cursor *xc;
++				MDB_val dk = d, dd = {0, NULL};
++				rc = mdb_xcursor_init1(mc, node);
++				if (rc)
++					goto done;
++				xc = &mc->mc_xcursor->mx_cursor;
++				rc = mdb_cursor_get(xc, &dk, &dd, MDB_SET_KEY);
++				if (rc)
++					goto done;
++				rc = mdb_agg_query_cursor_rank_base(xc,
++					MDB_AGG_WEIGHT_ENTRIES, &dup);
++				if (rc)
++					goto done;
++			}
++		}
++	}
++	*rank = base + dup;
++	if (dup_index)
++		*dup_index = weight == MDB_AGG_WEIGHT_ENTRIES ? dup : 0;
++
++done:
++	mdb_cursor_close(mc);
++	return rc;
++}
++
++
++/* Prefix aggregate for the first `rank` logical entries.  This helper uses
++ * the public rank/select ordering contract but remains entirely read-only. */
++static int
++mdb_agg_query_prefix_rank_entries_fallback(MDB_txn *txn, MDB_dbi dbi,
++	uint64_t rank, MDB_aggval *out)
++{
++	MDB_db *db;
++	MDB_cursor *mc = NULL;
++	MDB_val key = {0, NULL}, data = {0, NULL};
++	MDB_aggval total;
++	int rc;
++
++	if (!out)
++		return EINVAL;
++	rc = mdb_agg_query_db(txn, dbi, &db);
++	if (rc)
++		return rc;
++	if (!(DB_AGGFLAGS(db) & MDB_AGG_ENTRIES))
++		return MDB_INCOMPATIBLE;
++	if (rank == 0) {
++		mdb_aggval_zero(out);
++		return MDB_SUCCESS;
++	}
++	rc = mdb_agg_query_totals_internal(txn, dbi, &total);
++	if (rc)
++		return rc;
++	if (rank > total.entries)
++		return MDB_NOTFOUND;
++	if (rank == total.entries) {
++		*out = total;
++		return MDB_SUCCESS;
++	}
++	rc = mdb_cursor_open(txn, dbi, &mc);
++	if (rc)
++		return rc;
++	rc = mdb_agg_query_select_cursor(mc, MDB_AGG_WEIGHT_ENTRIES,
++		rank, &key, &data, NULL);
++	if (!rc) {
++		if (db->md_flags & MDB_DUPSORT)
++			rc = mdb_agg_query_prefix_kd_internal(txn, dbi, &key, &data, 0, out);
++		else
++			rc = mdb_agg_query_prefix_key_internal(txn, dbi, &key, 0, out);
++	}
++	mdb_cursor_close(mc);
++	return rc;
++}
++
++/* Direct rank-space prefix for plain trees.  DUPSORT keeps the generic
++ * fallback because a boundary may end inside a duplicate container. */
++static int
++mdb_agg_query_prefix_rank_entries_internal(MDB_txn *txn, MDB_dbi dbi,
++	uint64_t rank, MDB_aggval *out)
++{
++	MDB_db *db;
++	MDB_cursor *mc = NULL;
++	MDB_page *mp;
++	uint16_t agg;
++	uint64_t remaining;
++	int rc;
++
++	if (!out) return EINVAL;
++	rc = mdb_agg_query_db(txn, dbi, &db);
++	if (rc) return rc;
++	agg = DB_AGGFLAGS(db);
++	if (!(agg & MDB_AGG_ENTRIES)) return MDB_INCOMPATIBLE;
++	if (db->md_flags & MDB_DUPSORT)
++		return mdb_agg_query_prefix_rank_entries_fallback(txn, dbi, rank, out);
++	if (rank > (uint64_t)db->md_entries) return MDB_NOTFOUND;
++	if (rank == 0) { mdb_aggval_zero(out); return MDB_SUCCESS; }
++	if (rank == (uint64_t)db->md_entries) { mdb_db_get_aggval(db, out); return MDB_SUCCESS; }
++	mdb_aggval_zero(out);
++	rc = mdb_cursor_open(txn, dbi, &mc);
++	if (rc) return rc;
++	rc = mdb_page_search(mc, NULL, MDB_PS_ROOTONLY);
++	if (rc) goto done;
++	remaining = rank;
++	mp = mc->mc_pg[mc->mc_top];
++	while (IS_BRANCH(mp)) {
++		indx_t i, n = NUMKEYS(mp);
++		if (PAGE_AGGFLAGS(mp) != agg) { rc = MDB_CORRUPTED; goto done; }
++		for (i = 0; i < n; ++i) {
++			MDB_node *node = NODEPTR(mp, i);
++			uint64_t cnt;
++			rc = mdb_agg_query_branch_weight(mp, node, MDB_AGG_WEIGHT_ENTRIES, &cnt);
++			if (rc) goto done;
++			if (remaining >= cnt) {
++				rc = mdb_agg_query_add_branch_prefix(mc, mp, i, out);
++				if (rc) goto done;
++				remaining -= cnt;
++				if (!remaining) { rc = MDB_SUCCESS; goto done; }
++			} else {
++				mc->mc_ki[mc->mc_top] = i;
++				rc = mdb_page_get(mc, NODEPGNO(node), &mp, NULL);
++				if (rc) goto done;
++				rc = mdb_cursor_push(mc, mp);
++				if (rc) goto done;
++				break;
++			}
++		}
++		if (i == n) { rc = MDB_CORRUPTED; goto done; }
++	}
++	if (!IS_LEAF(mp) || IS_LEAF2(mp)) { rc = MDB_CORRUPTED; goto done; }
++	{
++		indx_t i, n = NUMKEYS(mp);
++		for (i = 0; i < n && remaining; ++i) {
++			MDB_aggval one;
++			rc = mdb_agg_query_leaf_item(mc, mp, i, &one);
++			if (rc) goto done;
++			rc = mdb_agg_query_add_value_inplace(agg, out, &one);
++			if (rc) goto done;
++			--remaining;
++		}
++		if (remaining) rc = MDB_CORRUPTED;
++	}
++done:
++	mdb_cursor_close(mc);
++	return rc;
++}
++
++/* Initialize/reuse the absolute entry-rank interval represented by a window.
++ * The caller contract requires the same bounds when reusing a populated
++ * descriptor; flags/schema changes force reinitialization. */
++static int
++mdb_agg_window_ensure(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *low_key, const MDB_val *low_data,
++	const MDB_val *high_key, const MDB_val *high_data,
++	unsigned range_flags, MDB_agg_window *window,
++	uint64_t *total_entries, uint64_t *abs_lo, uint64_t *abs_hi,
++	MDB_aggval *a_lo, int *have_lo, MDB_aggval *a_hi, int *have_hi,
++	int *did_init)
++{
++	MDB_db *db;
++	uint16_t agg;
++	unsigned schema, lower_incl, upper_incl;
++	MDB_aggval tot, lo, hi;
++	uint64_t tentries, alo, ahi;
++	int rc, hlo = 0, hhi = 0;
++
++	if (!window)
++		return EINVAL;
++	rc = mdb_agg_query_db(txn, dbi, &db);
++	if (rc)
++		return rc;
++	if (range_flags & ~MDB_RANGE_ALLOWED_FLAGS)
++		return EINVAL;
++	agg = DB_AGGFLAGS(db);
++	schema = DB_AGGSCHEMAFLAGS(db);
++	if (!agg || !(agg & MDB_AGG_ENTRIES))
++		return MDB_INCOMPATIBLE;
++	lower_incl = !!(range_flags & MDB_RANGE_LOWER_INCL);
++	upper_incl = !!(range_flags & MDB_RANGE_UPPER_INCL);
++
++	if (!(window->mv_flags && window->mv_flags == schema &&
++		window->mv_range_flags == range_flags)) {
++		rc = mdb_agg_query_totals_internal(txn, dbi, &tot);
++		if (rc) return rc;
++		tentries = tot.entries;
++		if (!high_key) { hi = tot; hhi = 1; }
++		else if (high_data) {
++			rc = mdb_agg_query_prefix_kd_internal(txn, dbi, high_key, high_data,
++				upper_incl, &hi); if (rc) return rc; hhi = 1;
++		} else {
++			rc = mdb_agg_query_prefix_key_internal(txn, dbi, high_key,
++				upper_incl, &hi); if (rc) return rc; hhi = 1;
++		}
++		if (!low_key) { mdb_aggval_zero(&lo); hlo = 1; }
++		else if (low_data) {
++			rc = mdb_agg_query_prefix_kd_internal(txn, dbi, low_key, low_data,
++				!lower_incl, &lo); if (rc) return rc; hlo = 1;
++		} else {
++			rc = mdb_agg_query_prefix_key_internal(txn, dbi, low_key,
++				!lower_incl, &lo); if (rc) return rc; hlo = 1;
++		}
++		alo = lo.entries; ahi = hi.entries;
++		if (ahi < alo) ahi = alo;
++		window->mv_flags = schema;
++		window->mv_range_flags = range_flags;
++		window->mv_total_entries = tentries;
++		window->mv_abs_lo = alo;
++		window->mv_abs_hi = ahi;
++		if (did_init) *did_init = 1;
++	} else {
++		tentries = window->mv_total_entries;
++		alo = window->mv_abs_lo;
++		ahi = window->mv_abs_hi;
++		if (did_init) *did_init = 0;
++	}
++	if (total_entries) *total_entries = tentries;
++	if (abs_lo) *abs_lo = alo;
++	if (abs_hi) *abs_hi = ahi;
++	if (did_init && *did_init) {
++		if (a_lo) *a_lo = lo;
++		if (a_hi) *a_hi = hi;
++		if (have_lo) *have_lo = hlo;
++		if (have_hi) *have_hi = hhi;
++	} else {
++		if (have_lo) *have_lo = 0;
++		if (have_hi) *have_hi = 0;
++	}
++	return MDB_SUCCESS;
++}
++
++int ESECT
++mdb_agg_window_aggregate(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *low_key, const MDB_val *low_data,
++	const MDB_val *high_key, const MDB_val *high_data,
++	unsigned range_flags, MDB_agg_window *window,
++	uint64_t rel_begin, uint64_t rel_end, MDB_agg *out)
++{
++	MDB_db *db;
++	uint16_t agg;
++	unsigned schema;
++	uint64_t abs_lo, abs_hi, total_entries, win_size, abs_begin, abs_end;
++	MDB_aggval a_lo, a_hi, p_begin, p_end;
++	int have_lo = 0, have_hi = 0, did_init = 0, rc;
++
++	if (!out || !window)
++		return EINVAL;
++	rc = mdb_agg_query_db(txn, dbi, &db);
++	if (rc) return rc;
++	if (range_flags & ~MDB_RANGE_ALLOWED_FLAGS) return EINVAL;
++	agg = DB_AGGFLAGS(db); schema = DB_AGGSCHEMAFLAGS(db);
++	if (!agg || !(agg & MDB_AGG_ENTRIES)) return MDB_INCOMPATIBLE;
++	rc = mdb_agg_window_ensure(txn, dbi, low_key, low_data, high_key, high_data,
++		range_flags, window, &total_entries, &abs_lo, &abs_hi,
++		&a_lo, &have_lo, &a_hi, &have_hi, &did_init);
++	if (rc) return rc;
++	win_size = abs_hi - abs_lo;
++	if (rel_end == MDB_AGG_WINDOW_END) rel_end = win_size;
++	if (rel_begin > rel_end || rel_end > win_size) return EINVAL;
++	abs_begin = abs_lo + rel_begin; abs_end = abs_lo + rel_end;
++	mdb_agg_query_zero_public(schema, out);
++	if (abs_begin == abs_end) return MDB_SUCCESS;
++	if (did_init && have_lo && abs_begin == abs_lo) p_begin = a_lo;
++	else { rc = mdb_agg_query_prefix_rank_entries_internal(txn, dbi, abs_begin, &p_begin); if (rc) return rc; }
++	if (did_init && have_hi && abs_end == abs_hi) p_end = a_hi;
++	else { rc = mdb_agg_query_prefix_rank_entries_internal(txn, dbi, abs_end, &p_end); if (rc) return rc; }
++	out->mv_agg_entries = p_end.entries - p_begin.entries;
++	if (agg & MDB_AGG_HASHSUM) {
++		memcpy(out->mv_agg_hashes, p_end.hashsum, MDB_HASH_SIZE);
++		mdb_agg_hash_sub(out->mv_agg_hashes, p_begin.hashsum);
++	}
++	if (agg & MDB_AGG_KEYS) {
++		if (!(db->md_flags & MDB_DUPSORT)) {
++			out->mv_agg_keys = p_end.keys - p_begin.keys;
++		} else if (out->mv_agg_entries) {
++			MDB_cursor *mc = NULL;
++			MDB_val lk = {0,NULL}, ld = {0,NULL}, hk = {0,NULL}, hd = {0,NULL};
++			uint64_t keys = 0;
++			rc = mdb_cursor_open(txn, dbi, &mc); if (rc) return rc;
++			rc = mdb_agg_query_select_cursor(mc, MDB_AGG_WEIGHT_ENTRIES, abs_begin,
++				&lk, &ld, NULL);
++			if (!rc && abs_end < total_entries) {
++				rc = mdb_agg_query_select_cursor(mc, MDB_AGG_WEIGHT_ENTRIES, abs_end,
++					&hk, &hd, NULL);
++				if (!rc) rc = mdb_agg_query_range_kd_keys(txn, dbi, &lk, &ld, 1,
++					&hk, &hd, 0, &keys);
++			} else if (!rc) {
++				rc = mdb_agg_query_range_kd_keys(txn, dbi, &lk, &ld, 1,
++					NULL, NULL, 0, &keys);
++			}
++			mdb_cursor_close(mc);
++			if (rc) return rc;
++			out->mv_agg_keys = keys;
++		}
++	}
++	return MDB_SUCCESS;
++}
++
++int ESECT
++mdb_agg_window_rank(MDB_txn *txn, MDB_dbi dbi,
++	const MDB_val *low_key, const MDB_val *low_data,
++	const MDB_val *high_key, const MDB_val *high_data,
++	unsigned range_flags, MDB_agg_window *window,
++	const MDB_val *key, const MDB_val *data, uint64_t *rel_rank)
++{
++	MDB_db *db;
++	uint64_t total_entries, abs_lo, abs_hi, abs_rank = 0, win_size;
++	MDB_val k, d = {0,NULL};
++	int rc, data_unspecified, key_only_fastpath;
++	unsigned upper_incl;
++
++	if (!window || !key || !rel_rank) return EINVAL;
++	rc = mdb_agg_query_db(txn, dbi, &db); if (rc) return rc;
++	if (!(DB_AGGFLAGS(db) & MDB_AGG_ENTRIES)) return MDB_INCOMPATIBLE;
++	if (range_flags & ~MDB_RANGE_ALLOWED_FLAGS) return EINVAL;
++	rc = mdb_agg_window_ensure(txn, dbi, low_key, low_data, high_key, high_data,
++		range_flags, window, &total_entries, &abs_lo, &abs_hi,
++		NULL, NULL, NULL, NULL, NULL);
++	if (rc) return rc;
++	win_size = abs_hi - abs_lo;
++	if (!win_size) { *rel_rank = 0; return MDB_SUCCESS; }
++	upper_incl = !!(range_flags & MDB_RANGE_UPPER_INCL);
++	data_unspecified = !data || (!data->mv_size && !data->mv_data);
++	key_only_fastpath = !low_data && !high_data && data_unspecified;
++	if (key_only_fastpath) {
++		if (low_key && mdb_cmp(txn, dbi, (MDB_val *)key, (MDB_val *)low_key) <= 0) {
++			*rel_rank = 0; return MDB_SUCCESS;
++		}
++		if (high_key) {
++			int c = mdb_cmp(txn, dbi, (MDB_val *)key, (MDB_val *)high_key);
++			if (c > 0 || (c == 0 && !upper_incl)) { *rel_rank = win_size; return MDB_SUCCESS; }
++		}
++	}
++	k = *key; if (data) d = *data;
++	rc = mdb_agg_rank(txn, dbi, &k, &d, MDB_AGG_WEIGHT_ENTRIES,
++		MDB_AGG_RANK_SET_RANGE, &abs_rank, NULL);
++	if (rc == MDB_NOTFOUND) abs_rank = total_entries;
++	else if (rc) return rc;
++	if (abs_rank < abs_lo) abs_rank = abs_lo;
++	if (abs_rank > abs_hi) abs_rank = abs_hi;
++	*rel_rank = abs_rank - abs_lo;
++	return MDB_SUCCESS;
++}

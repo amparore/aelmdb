@@ -1,0 +1,7 @@
+impl	mode	hash	status	signature_or_failure
+aelmdb	query	32	PASS	0d47be1ce619f8bb
+aggmaint	query	32	PASS	0d47be1ce619f8bb
+aelmdb	growth	32	PASS	540f6ba1c866836f
+aggmaint	growth	32	PASS	540f6ba1c866836f
+aelmdb	stress	32	PASS	5858bc4640074533
+aggmaint	stress	32	PASS	5858bc4640074533

@@ -1,11 +1,14 @@
 # **AELMDB**: Anti-Entropy Lightning Memory-Mapped Database
 
-**AELMDB (Anti-Entropy LMDB)** is a fork of **[LMDB](https://github.com/LMDB/lmdb)** that augments the B+tree with **aggregate metadata stored in branch pages**. In practice, this turns LMDB’s ordered keyspace into something you can query by **position** and **summarize by range** without scanning leaf pages.
+**Current release: AELMDB 0.2.0**
+
+**AELMDB (Anti-Entropy LMDB)** is a fork of **[LMDB](https://github.com/LMDB/lmdb)** that augments its B+tree with **maintained subtree aggregates** and a **bottom-up mutation engine**. In practice, this turns LMDB’s ordered keyspace into something you can query by **position** and **summarize by range** without scanning leaf pages, while keeping aggregate maintenance local to the pages affected by each update.
 
 This enables:
-- **Order-statistics** on the database order (fast `rank` / `select`), extending the [order statistics-B-tree](https://en.wikipedia.org/wiki/Order_statistic_tree) design used in **[DLMDB](https://github.com/datalevin/dlmdb)**
+- **Order-statistics** on the database order (fast `rank` / `select`), extending the counted/order-statistics B-tree design used in **[DLMDB](https://github.com/datalevin/dlmdb)**
 - **Fast range summaries** (counts + fixed-size **hashsums**) that are composable and efficient for large datasets
-- **Anti-entropy / reconciliation-friendly primitives**, specifically targeting **Range-Based Set Reconciliation ([RBSR](https://logperiodic.com/rbsr.html))**, where you repeatedly compare and split ordered ranges using compact aggregates
+- **Anti-entropy / reconciliation-friendly primitives**, specifically targeting **Range-Based Set Reconciliation ([RBSR](https://logperiodic.com/rbsr.html))**, where peers repeatedly compare and split ordered ranges using compact aggregates
+- **Bottom-up B+tree mutation**, where structural changes are settled from child to parent and aggregate changes are propagated upward as local delta updates
 
 
 
@@ -28,6 +31,54 @@ When enabled, AELMDB maintains a **hashsum aggregate** by summing (with wraparou
 
 In the same mechanism, AELMDB can also maintain **counts** (entries and/or distinct keys), enabling efficient order-statistics queries (rank/select) and fast range counts.
 
+## Bottom-up mutation and aggregate maintenance
+
+AELMDB reworks LMDB’s B+tree mutation path around a **bottom-up structural update model**. This is a core property of the database engine itself, not an aggregate-specific mechanism.
+
+During structural operations such as splits, rekeys, moves, and merges, each affected child level is brought to its final state **before** the corresponding update is published to its parent. Parent links therefore always refer to child pages whose structure and contents are already definitive for the current mutation.
+
+This child-before-parent ordering provides a strong invariant for aggregate maintenance. For a logical record change, AELMDB computes the contribution **before** and **after** the operation and propagates that delta bottom-up through the structurally unchanged ancestor prefix. Levels affected by structural rewrites instead publish the **exact aggregate of their finalized child pages**. Aggregate state is therefore maintained from the final state produced by the mutation, without subtree scans or post-hoc repair passes.
+
+For `MDB_DUPSORT`, the duplicate tree is completed first; only then is the final contribution of the primary `(key, duplicate-set)` item settled in the primary tree.
+
+Compared with LMDB’s original mutation flow, this gives AELMDB a more explicit and locally verifiable structural update contract, and provides the foundation for maintaining counts and hashsums incrementally with bounded work along the modified B+tree path.
+
+## Validation, stress testing and performance
+
+AELMDB has been developed with an **invariant-driven, differential test strategy**. The test suite does not only exercise the public aggregate API: it compares LMDB-compatible behavior against the upstream baseline, checks persistent tree structure, independently recomputes aggregate state, stresses deep split/merge paths, and validates the bottom-up mutation contract itself.
+
+Validation includes:
+
+- the upstream LMDB `mtest` programs and the AELMDB API/unit/keyhash/advanced suites;
+- deterministic differential workloads covering `put`/`delete`, cursor updates, `MDB_MULTIPLE`, `MDB_RESERVE`, `MDB_APPEND*`, nested transactions, `drop`, plain DBs, `MDB_DUPSORT`, and `MDB_DUPFIXED`;
+- large-key structural stress designed to create low-fanout and taller trees, plus targeted split, rebalance, root-collapse, deep-duplicate-tree, and cursor-fixup workloads;
+- an **independent aggregate-integrity oracle** that recursively recomputes subtree aggregates, and a separate **unwind-boundary oracle** that verifies the child-before-parent structural invariant, including duplicate subtrees;
+- frozen aggregate signatures, cross-format/open tests, regression tests for previously discovered defects, and byte-for-byte replay of the four-stage evolution chain;
+- dedicated ASan/UBSan builds and a portable byte-wise hash backend used with odd aggregate widths to stress representation and alignment independently of the production 64-bit-limb backend.
+
+The long differential campaigns used during consolidation included **200 seeds × 20,000 operations**, **20 seeds × 100,000 operations**, focused duplicate-set churn, and **300 aggregate-enabled seeds**; an additional 20-seed campaign ran the independent aggregate-integrity oracle after every write. The resulting operation traces matched LMDB for the LMDB-compatible behavior under test.
+
+Coverage was measured specifically on the rewritten **bottom-up mutation core** after the focused structural campaign: **1,407 / 1,534 lines (91.7%)** and **799 / 962 branches (83.1%)** were exercised. Core structural functions reached similarly high line coverage (`mdb_page_split_local`: 97%, `mdb_rebalance_root`: 94%, `mdb_node_move_local`: 91%). The remaining uncovered code is dominated by rare allocation/I/O error paths, spill paths, and defensive branches.
+
+### Performance impact
+
+Performance has been measured against the **LMDB 0.9.70 baseline** using the same `-O3 -DNDEBUG`, `MDB_NOSYNC` benchmark configuration on a pinned CPU. These figures are engineering measurements from the release audit, not portable absolute performance guarantees; small differences of a few percent should be treated as noise.
+
+For a representative workload of 500k random plain puts:
+
+| Configuration | Put time vs LMDB | Interpretation |
+|---|---:|---|
+| LMDB 0.9.70 | **1.00×** | baseline |
+| bottom-up engine (`02-bottomup`) | **1.01×** | structural rewrite alone |
+| AELMDB 0.2.0, aggregate features disabled | **1.05×** | full AELMDB engine with ordinary LMDB DBIs |
+| AELMDB 0.2.0, `ENTRIES + KEYS + HASHSUM`, 32-byte hash | **1.20×** | full aggregate maintenance enabled |
+
+On the same aggregate-enabled workload, delete measured approximately **1.16×** the LMDB baseline. Thus the bottom-up engine itself adds only a few-percent structural cost in the measured workload, while the optional aggregate maintenance accounts for most of the additional write overhead. The optimized 64-bit-limb hashsum backend is materially faster than the portable byte-wise validation backend (about **1.26×** faster for plain aggregate puts and **1.36×** for the measured DUPSORT workload at a 32-byte hash width).
+
+DUPSORT stress also shows no evidence of per-update work growing linearly with duplicate-set cardinality: the measured cost per inserted duplicate remains broadly stable as duplicate sets grow, with step changes attributable to representation/tree-height transitions rather than full duplicate-set rescans.
+
+The query layer is likewise benchmarked as part of the release process. Aggregate prefix/range/window queries are at least comparable to the first-generation AELMDB reference on the measured plain workload, while rank/select are faster. Detailed methodology and raw release-audit results are kept in [`evolution/results/performance-audit.md`](evolution/results/performance-audit.md); structural coverage details are in [`evolution/results/bottomup-coverage.md`](evolution/results/bottomup-coverage.md).
+
 ### New DBI flags (aggregate schema)
 
 These flags (passed to `mdb_dbi_open()`) select which aggregate components are maintained in branch pages:
@@ -37,6 +88,8 @@ These flags (passed to `mdb_dbi_open()`) select which aggregate components are m
 * `MDB_AGG_HASHSUM`: maintain a fixed-size wraparound accumulator of _hash slices_ from each entry.
 * `MDB_AGG_HASHSOURCE_FROM_KEY`: uses the **key bytes** as the hash source instead of value bytes. 
   * Only meaningful with `MDB_AGG_HASHSUM`, and **incompatible with `MDB_DUPSORT`**.
+
+**`MDB_RESERVE` note:** value-sourced `MDB_AGG_HASHSUM` is incompatible with `MDB_RESERVE`, because the reserved value bytes are filled after the put call returns and therefore cannot be included in the maintained hash contribution at mutation time. Key-sourced hashsums on plain DBIs may use `MDB_RESERVE`.
 
 
 
@@ -54,7 +107,8 @@ For every entry, AELMDB extracts exactly **`MDB_HASH_SIZE` bytes**:
   * `hash_offset < 0`: start from the end, where `-1` means “use the last `MDB_HASH_SIZE` bytes” (and `-k` means `(k-1)` bytes earlier)
 
 The extracted slice is `source[start .. start + MDB_HASH_SIZE)` where `source` is `value` (default) or `key` (when `MDB_AGG_HASHSOURCE_FROM_KEY` is set).
-`MDB_HASH_SIZE` defaults to **32 bytes** and is currently required to be a **multiple of 8**.
+
+`MDB_HASH_SIZE` defaults to **32 bytes**. Production builds use the optimized **64-bit-limb** arithmetic backend and therefore require `MDB_HASH_SIZE` to be a **multiple of 8**. For validation and alignment stress testing, defining `MDB_AGG_GENERIC_HASH_ARITH=1` enables the portable byte-oriented backend and permits arbitrary hash widths in the supported range **1..256 bytes**. The selected width is part of the AELMDB environment format: opening an environment with a build configured for a different `MDB_HASH_SIZE` is rejected with `MDB_VERSION_MISMATCH`.
 
 
 ---
@@ -150,30 +204,26 @@ As said before, the hash source is the value by default, and becomes the key whe
 
 
 ---
-### Hashsum wraparound algebra (helper layer)
+### Hashsum wraparound algebra
 
-AELMDB’s hashsum is a fixed-size **`MDB_HASH_SIZE`-byte accumulator**. 
-Conceptually it behaves like a single unsigned integer and all operations are done **modulo `2^(8*MDB_HASH_SIZE)`** (i.e. classical wraparound arithmetic). 
+AELMDB’s hashsum is a fixed-size **`MDB_HASH_SIZE`-byte accumulator**. Conceptually it behaves like a single unsigned integer and all operations are performed **modulo `2^(8*MDB_HASH_SIZE)`** (classical wraparound arithmetic). Addition and subtraction therefore compose naturally across subtree summaries and range differences.
 
-The header provides small inline helpers implemented on 64-bit unsigned integers:
+The default backend operates on **64-bit limbs** with carry/borrow support optimized for the host compiler, while preserving safe loads/stores for unaligned data. A portable byte-oriented backend can be enabled with `MDB_AGG_GENERIC_HASH_ARITH=1`; it is intentionally retained for validation builds with odd or unusual aggregate widths.
+
+AELMDB also exposes a small helper layer using exactly the same arithmetic as the maintained aggregates:
 
 ```c
-/* acc += x (mod 2^(8*MDB_HASH_SIZE)) */
-static inline void mdb_hashsum_add(uint8_t *acc, const uint8_t *x);
-
-/* acc -= x (mod 2^(8*MDB_HASH_SIZE)) */
-static inline void mdb_hashsum_sub(uint8_t *acc, const uint8_t *x);
-
-/* out = a - b (mod 2^(8*MDB_HASH_SIZE)) */
-static inline void mdb_hashsum_diff(uint8_t *out, const uint8_t *a, const uint8_t *b);
-
-/* true iff buffer is all zeros */
-static inline int  mdb_hashsum_is_zero(const uint8_t *p);
+void mdb_hashsum_add(uint8_t *acc, const uint8_t *x);
+void mdb_hashsum_sub(uint8_t *acc, const uint8_t *x);
+void mdb_hashsum_diff(uint8_t *out, const uint8_t *a, const uint8_t *b);
+int  mdb_hashsum_is_zero(const uint8_t *p);
+int  mdb_hashsum_extract_bytes(const void *p, size_t sz, int hash_offset,
+                               uint8_t out[MDB_HASH_SIZE]);
+int  mdb_hashsum_extract(const MDB_val *data, int hash_offset,
+                         uint8_t out[MDB_HASH_SIZE]);
 ```
 
-Since the hashsum is defined as “sum of the MDB_HASH_SIZE-byte slice selected by hash_offset”, the header provides bounds-checked slice helpers:
-`mdb_hashsum_slice_ptr_bytes`/`mdb_hashsum_slice_ptr`(pointer) and `mdb_hashsum_extract_bytes`/`mdb_hashsum_extract` (copy).
-
+The logical hash slice itself remains defined solely by the DBI schema: source (`value` or `key`), signed `hash_offset`, and `MDB_HASH_SIZE`.
 
 
 
@@ -343,7 +393,7 @@ int mdb_agg_rank(
   MDB_txn        *txn,       // IN: transaction handle
   MDB_dbi         dbi,       // IN: target DBI
   MDB_val        *key,       // IN: query key; OUT: located key (SET_RANGE mode)
-  MDB_val        *data,      // IN: optional query value; OUT: located value (SET_RANGE mode)
+  MDB_val        *data,      // IN/OUT: query/located value; must be a valid MDB_val pointer
   MDB_agg_weight  weight,    // IN: MDB_AGG_WEIGHT_ENTRIES or MDB_AGG_WEIGHT_KEYS
   unsigned        flags,     // IN: MDB_AGG_RANK_EXACT or MDB_AGG_RANK_SET_RANGE
   uint64_t       *rank,      // OUT: zero-based rank in the chosen unit
@@ -371,7 +421,7 @@ int mdb_agg_select(
 ### `mdb_agg_cursor_seek_rank()`
 
 Positions an existing cursor at a given **entry rank** and returns the record at that position.
-This is the “jump then iterate” primitive: you seek by rank once, then use normal cursor iteration (`MDB_NEXT`, etc.) efficiently from that point.
+This is the “jump then iterate” primitive: you seek by rank once, then use normal cursor iteration (`MDB_NEXT`, etc.) efficiently from that point. `key` and `data` may be `NULL` when the caller only needs to reposition the cursor.
 
 ```c
 int mdb_agg_cursor_seek_rank(
@@ -447,7 +497,7 @@ typedef struct MDB_agg_window {
 ### `mdb_agg_window_aggregate()`
 
 Computes aggregates for a **relative entry-rank subrange** inside a subrange window.
-If the cache is empty or the bounds changed, it (re)computes the window’s absolute rank interval, then answers subrange queries efficiently.
+On first use of a zero-initialized descriptor, it computes the window’s absolute rank interval; subsequent calls reuse that cached mapping. If the window bounds change, the caller must reinitialize (zero) the descriptor before reuse.
 
 ```c
 int mdb_agg_window_aggregate(
@@ -502,31 +552,23 @@ It finds the first record ≥ `(key,data)` in the DBI’s total order, clamps th
 
 # Debug & validation support
 
-Because AELMDB maintains extra on-page metadata (counts + hashsums), it also adds extensive **opt-in debugging hooks** to detect aggregate drift early and make stress tests fail fast. These checks are intentionally expensive and are meant for development and validation rather than production.
+Because AELMDB maintains extra on-page metadata (counts + hashsums), the source also includes **opt-in diagnostic oracles** intended for development, stress testing and validation rather than production use. These checks are deliberately independent from the maintenance path: they verify stored metadata instead of repairing it.
 
-### `MDB_AGG_CHECK` (environment flag)
+### `MDB_DEBUG_AGG_INTEGRITY` and `mdb_agg_check_integrity()`
 
-`MDB_AGG_CHECK` is an **environment flag** that enables *extra aggregate integrity verification after write operations*. 
-
-```c
-mdb_env_set_flags(env, MDB_AGG_CHECK, 1);   /* enable expensive post-write agg checks */
-mdb_env_set_flags(env, MDB_AGG_CHECK, 0);   /* disable */
-```
-
-### `MDB_DEBUG_AGG_INTEGRITY` (preprocessor macro) and `mdb_dbg_check_agg_db()`
-
-When AELMDB is compiled with `MDB_DEBUG_AGG_INTEGRITY`, it exposes a dedicated API to **explicitly verify aggregate consistency** for a DBI by performing a linear scan of the entire database and checking that aggregates are consistent:
+When AELMDB is compiled with `MDB_DEBUG_AGG_INTEGRITY=1`, the header exposes a diagnostic API that recursively walks the complete DBI (including persistent `MDB_DUPSORT` subtrees), recomputes exact aggregates, verifies every stored branch prefix, and checks the root result against the `MDB_db` totals:
 
 ```c
-#ifdef MDB_DEBUG_AGG_INTEGRITY
-int mdb_dbg_check_agg_db(MDB_txn *txn, MDB_dbi dbi);
+#if defined(MDB_DEBUG_AGG_INTEGRITY) && MDB_DEBUG_AGG_INTEGRITY
+int mdb_agg_check_integrity(MDB_txn *txn, MDB_dbi dbi);
 #endif
 ```
 
-This is intended for unit tests that want to run a full “check aggregates now” pass on demand. 
-This macro also activates several (slow) integrity checks.
-A second macro `MDB_DEBUG_AGG_PRINT` adds important debug prints of the internal steps, again for debug purposes.
+### `MDB_DEBUG_UNWIND`
 
+`MDB_DEBUG_UNWIND=1` enables a second structural oracle used by the test suite. It checks the bottom-up mutation contract: ancestor pages above the reported structural rewrite boundary must remain byte-identical until logical aggregate settlement is applied. Primary and duplicate-tree paths are checked independently.
+
+Both mechanisms are validation tools only; neither participates in normal aggregate maintenance or error recovery.
 
 
 
@@ -549,8 +591,9 @@ Practical implications:
 
 ## Relationship to the counted-DB API of DLMDB
 
-AELMDB takes inspiration (and some design ideas) from [DLMDB](https://github.com/datalevin/dlmdb/tree/main) (Datalevin’s LMDB fork), which popularized *counted B-tree* order-statistics and includes improvements such as more robust interrupt handling. 
-DLMDB-style *counted B-tree* functionality (as reflected in the original header you attached) provides:
+AELMDB takes inspiration from [DLMDB](https://github.com/datalevin/dlmdb/tree/main) (Datalevin’s LMDB fork), in particular its *counted B-tree* order-statistics design and selected engineering ideas. DLMDB remains a separate project with its own format and API.
+
+DLMDB-style counted-tree functionality provides:
 
 * a single `MDB_COUNTED` DBI flag, and
 * `mdb_counted_*` APIs focused on **record-count order-statistics** (entries, rank, select). 
@@ -569,6 +612,19 @@ A simple conceptual mapping:
 * New: `MDB_AGG_KEYS`, `MDB_AGG_HASHSUM`, window subrange anti-entropy helpers (`MDB_agg_window`, `mdb_agg_window_*`).
 
 
-## Compile-time detection
+## Project and format versioning
 
-The `lmdb.h` header of AELMDB defines the macro `MDB_AELMDB_VERSION` so applications can **detect AELMDB at compile time** and conditionally enable AELMDB-specific features (distinguishing it from upstream LMDB and other forks).
+AELMDB uses an independent project release line rather than reinterpreting LMDB’s upstream `MDB_VERSION_*` macros. The current release is **AELMDB 0.2.0**; the earlier implementation is retained in repository history as **AELMDB First Generation (v0.1.0 tag)**.
+
+The source deliberately retains LMDB’s upstream `MDB_VERSION_*` values for LMDB lineage/API compatibility. AELMDB clients should identify the fork and its API release with:
+
+```c
+MDB_AELMDB_VERSION_MAJOR
+MDB_AELMDB_VERSION_MINOR
+MDB_AELMDB_VERSION_PATCH
+MDB_AELMDB_VERSION
+MDB_AELMDB_VERSION_STRING
+```
+
+For example, a consumer requiring the current API can use `#if MDB_AELMDB_VERSION < MDB_VERINT(0, 2, 0)`. AELMDB’s persistent environment format has its own internal data-version tag and also encodes the configured `MDB_HASH_SIZE`, so incompatible hash widths are rejected when an environment is opened. `MDB_AGGFORMAT_VERSION` identifies the aggregate-enabled persistent format and is intentionally separate from the project release number.
+

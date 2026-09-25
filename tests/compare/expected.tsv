@@ -1,0 +1,13 @@
+mode	hash	signature
+query	8	26d341275a2e4957
+growth	8	6ecfc926a53ee827
+stress	8	d3b7771f48fa36c3
+query	32	0d47be1ce619f8bb
+growth	32	540f6ba1c866836f
+stress	32	5858bc4640074533
+query	64	3233d1fd306578bc
+growth	64	f5da5e88f40186a0
+stress	64	2a32d9134dfa8ae4
+query	256	ca6db240135d4d25
+growth	256	1ed7410988b35b65
+stress	256	41d336dfc68688a5
